@@ -62,10 +62,25 @@ class MemoryManager:
                 return f.read()
         return ""
 
-    def save_summary(self, session_id: str, summary: str):
+    def get_messages_since_last_summary(self, session_id: str, limit: int) -> List[Dict[str, str]]:
+        """Fetches the last N messages which represent the chunk since the last summary trigger."""
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (session_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [{"role": row[0], "content": row[1]} for row in reversed(rows)]
+
+    def write_session_summary(self, session_id: str, markdown: str):
         summary_file = os.path.join(SUMMARIES_PATH, f"{session_id}.md")
         with open(summary_file, "w", encoding="utf-8") as f:
-            f.write(summary)
+            f.write(markdown)
+
+    def save_summary(self, session_id: str, summary: str):
+        # Kept for backward compatibility if needed, but redirects to write_session_summary
+        self.write_session_summary(session_id, summary)
 
     def get_knowledge(self) -> str:
         knowledge_file = "memory/knowledge.md"

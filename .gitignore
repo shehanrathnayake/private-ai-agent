@@ -15,3 +15,4 @@ dist/
 memory/agent_memory.db
 memory/summaries/*.md
 debug_*.py
+check_db.py
