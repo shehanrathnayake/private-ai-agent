@@ -1,0 +1,10 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./memory:/app/memory
+    env_file:
+      - .env
+    restart: always
