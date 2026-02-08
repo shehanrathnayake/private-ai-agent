@@ -1,6 +1,9 @@
+import os
 from datetime import datetime
 from app.openrouter import run_openrouter
-from app.config import SYSTEM_PROMPT, SUMMARY_THRESHOLD
+from app.config import (
+    SYSTEM_PROMPT, SUMMARY_THRESHOLD, IDENTITY_UPDATE_INTERVAL
+)
 from app.memory import memory_manager
 
 def run_agent(user_input: str, session_id: str) -> str:
@@ -10,9 +13,16 @@ def run_agent(user_input: str, session_id: str) -> str:
     # 2. Retrieve history and context
     history = memory_manager.get_history(session_id, limit=10)
     
-    # Refined Selective Recall (Phase 2)
-    # Only injects relevant sections of the session summary based on keywords
+    # Phase 2: Deterministic Recall
     relevant_memory = memory_manager.get_relevant_memory(session_id, user_input)
+    
+    # Phase 3: Associative Recall
+    associative_memory = memory_manager.get_associative_memory(user_input)
+    
+    # Phase 3: Identity-Aware Recall
+    identity = memory_manager.get_identity(user_input)
+    
+    # Core Knowledge
     knowledge = memory_manager.get_knowledge()
     
     # 3. Build the prompt with memory
@@ -21,8 +31,14 @@ def run_agent(user_input: str, session_id: str) -> str:
     if knowledge:
         prompt_sections.append(f"CORE KNOWLEDGE:\n{knowledge}")
     
+    if identity:
+        prompt_sections.append(identity)
+        
     if relevant_memory:
         prompt_sections.append(f"RELEVANT SESSION MEMORY:\n{relevant_memory}")
+        
+    if associative_memory:
+        prompt_sections.append(associative_memory)
         
     prompt_sections.append("CONVERSATION HISTORY:")
     for msg in history:
@@ -46,9 +62,16 @@ def run_agent(user_input: str, session_id: str) -> str:
         if msg_count > 0 and msg_count % SUMMARY_THRESHOLD == 0:
             print(f"[MEMORY] Summarization triggered for session {session_id} (count: {msg_count})")
             summarize_session(session_id)
+            
+            # Phase 3: Identity update interval
+            # We check total summary files to decide if it's time for an identity merge
+            summary_files = [f for f in os.listdir("memory/summaries") if f.endswith(".md")]
+            if len(summary_files) > 0 and len(summary_files) % IDENTITY_UPDATE_INTERVAL == 0:
+                memory_manager.update_identity()
+                
     except Exception as e:
         # Safety: Log the error and continue normally
-        print(f"[MEMORY] Summarization error: {e}")
+        print(f"[MEMORY] Summarization/Identity error: {e}")
         
     return agent_response
 
