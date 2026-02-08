@@ -41,10 +41,11 @@ def run_agent(user_input: str, session_id: str) -> str:
     try:
         msg_count = memory_manager.get_message_count(session_id)
         if msg_count > 0 and msg_count % SUMMARY_THRESHOLD == 0:
+            print(f"[MEMORY] Summarization triggered for session {session_id} (count: {msg_count})")
             summarize_session(session_id)
     except Exception as e:
         # Safety: Log the error and continue normally
-        print(f"Summarization error: {e}")
+        print(f"[MEMORY] Summarization error: {e}")
         
     return agent_response
 
@@ -60,17 +61,16 @@ def summarize_session(session_id: str):
     You are a memory consolidation module. Your task is to update a session summary based on the latest interaction.
     
     RULES:
-    - Extract ONLY explicit, stable facts.
-    - Extract communication or content preferences.
-    - Identify ongoing tasks or unresolved topics as 'Open Threads'.
-    - IGNORE jokes, filler, greetings, and transient conversation.
-    - Prefer correctness over completeness.
-    - If a section has no information, keep it empty.
+    - CONSOLIDATE: Use the existing summary and the latest messages to create an updated narrative. Do not delete stable facts from the previous summary unless they have been explicitly contradicted or changed.
+    - SCOPE: Extract ONLY explicit, stable facts and user/assistant-stated preferences.
+    - DO NOT INCLUDE: Instructions, future plans, internal reasoning, jokes, filler, or greetings.
+    - STRUCTURE: You must strictly follow the mandatory output structure provided below.
+    - ACCURACY: Prefer correctness over completeness. If a section has no information, leave it empty.
     
     EXISTING SUMMARY:
     {current_summary if current_summary else "No summary yet."}
     
-    LATEST MESSAGES SINCE LAST SUMMARY:
+    LATEST MESSAGES SINCE LAST SUMMARY ({SUMMARY_THRESHOLD} messages):
     {history_text}
     
     MANDATORY OUTPUT STRUCTURE:
@@ -91,22 +91,26 @@ def summarize_session(session_id: str):
     
     new_summary = run_openrouter(summary_prompt)
     
-    # Safety: Do not write if the LLM call failed
-    if not new_summary.startswith("Error"):
-        # Append/Ensure the timestamp if the LLM provided a placeholder or old one
-        timestamp = datetime.now().isoformat()
-        # Basic cleanup: ensuring the structure is maintained if LLM omitted it
-        if "## Last Updated" in new_summary:
-            lines = new_summary.split("\n")
-            cleaned_lines = []
-            for line in lines:
-                if line.strip().startswith("## Last Updated"):
-                    cleaned_lines.append("## Last Updated")
-                    cleaned_lines.append(timestamp)
-                    break # Stop adding lines after updating timestamp
-                cleaned_lines.append(line)
-            final_markdown = "\n".join(cleaned_lines)
-        else:
-            final_markdown = new_summary.strip() + f"\n\n## Last Updated\n{timestamp}"
-            
-        memory_manager.write_session_summary(session_id, final_markdown)
+    # 2. Safety & Validation
+    if new_summary.startswith("Error"):
+        print(f"[MEMORY] Summarization failed for {session_id}: API Error")
+        return
+
+    # Mandatory Header Protection
+    mandatory_headers = ["# Session Summary:", "## Known Facts", "## Preferences", "## Open Threads"]
+    if not all(header in new_summary for header in mandatory_headers):
+        print(f"[MEMORY] Summarization rejected for {session_id}: Malformed output (missing headers)")
+        return
+
+    # 3. Success: Finalize and Write
+    timestamp = datetime.now().isoformat()
+    
+    # Ensure the timestamp is correctly placed at the end
+    if "## Last Updated" in new_summary:
+        parts = new_summary.split("## Last Updated")
+        final_markdown = parts[0].strip() + f"\n\n## Last Updated\n{timestamp}"
+    else:
+        final_markdown = new_summary.strip() + f"\n\n## Last Updated\n{timestamp}"
+        
+    memory_manager.write_session_summary(session_id, final_markdown)
+    print(f"[MEMORY] Summary updated successfully: memory/summaries/{session_id}.md")
