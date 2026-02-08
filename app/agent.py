@@ -9,7 +9,10 @@ def run_agent(user_input: str, session_id: str) -> str:
     
     # 2. Retrieve history and context
     history = memory_manager.get_history(session_id, limit=10)
-    summary = memory_manager.get_summary(session_id)
+    
+    # Refined Selective Recall (Phase 2)
+    # Only injects relevant sections of the session summary based on keywords
+    relevant_memory = memory_manager.get_relevant_memory(session_id, user_input)
     knowledge = memory_manager.get_knowledge()
     
     # 3. Build the prompt with memory
@@ -18,8 +21,8 @@ def run_agent(user_input: str, session_id: str) -> str:
     if knowledge:
         prompt_sections.append(f"CORE KNOWLEDGE:\n{knowledge}")
     
-    if summary:
-        prompt_sections.append(f"PREVIOUS SUMMARY:\n{summary}")
+    if relevant_memory:
+        prompt_sections.append(f"RELEVANT SESSION MEMORY:\n{relevant_memory}")
         
     prompt_sections.append("CONVERSATION HISTORY:")
     for msg in history:
@@ -63,7 +66,8 @@ def summarize_session(session_id: str):
     RULES:
     - CONSOLIDATE: Use the existing summary and the latest messages to create an updated narrative. Do not delete stable facts from the previous summary unless they have been explicitly contradicted or changed.
     - SCOPE: Extract ONLY explicit, stable facts and user/assistant-stated preferences.
-    - DO NOT INCLUDE: Instructions, future plans, internal reasoning, jokes, filler, or greetings.
+    - OPEN THREADS: A thread is Active if it appears in the latest summary. A thread is RESOLVED if the user explicitly says it is resolved, OR the assistant explicitly confirms completion. Resolved threads MUST be removed and never reappear. No inference allowed.
+    - DO NOT INCLUDE: Instructions, generic plans, internal reasoning, jokes, filler, or greetings.
     - STRUCTURE: You must strictly follow the mandatory output structure provided below.
     - ACCURACY: Prefer correctness over completeness. If a section has no information, leave it empty.
     

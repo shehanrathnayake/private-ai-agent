@@ -89,5 +89,59 @@ class MemoryManager:
                 return f.read()
         return ""
 
+    def parse_summary_sections(self, summary_text: str) -> Dict[str, str]:
+        """Parses the summary text into structured sections based on mandatory headers."""
+        sections = {
+            "Known Facts": "",
+            "Preferences": "",
+            "Open Threads": ""
+        }
+        
+        current_section = None
+        lines = summary_text.split("\n")
+        
+        for line in lines:
+            if "## Known Facts" in line:
+                current_section = "Known Facts"
+            elif "## Preferences" in line:
+                current_section = "Preferences"
+            elif "## Open Threads" in line:
+                current_section = "Open Threads"
+            elif "## Last Updated" in line:
+                current_section = None
+            elif current_section and line.strip():
+                # Avoid capturing placeholders like <explicit facts only>
+                if not (line.strip().startswith("- <") and line.strip().endswith(">")):
+                    sections[current_section] += line + "\n"
+        
+        return {k: v.strip() for k, v in sections.items()}
+
+    def get_relevant_memory(self, session_id: str, user_input: str) -> str:
+        """Deterministic rule-based recall logic to select relevant sections of the summary."""
+        summary_text = self.get_summary(session_id)
+        if not summary_text:
+            return ""
+            
+        sections = self.parse_summary_sections(summary_text)
+        relevant_parts = []
+        user_input_lower = user_input.lower()
+        
+        # Rule 1: Name/Identity -> Known Facts
+        name_keywords = ["name", "who am i", "remember me", "identity"]
+        if any(kw in user_input_lower for kw in name_keywords) and sections["Known Facts"]:
+            relevant_parts.append(f"RECALLED KNOWN FACTS:\n{sections['Known Facts']}")
+            
+        # Rule 2: Preferences/Explicit Likes -> Preferences
+        pref_keywords = ["preference", "like", "dislike", "favorite", "style", "prefer"]
+        if any(kw in user_input_lower for kw in pref_keywords) and sections["Preferences"]:
+            relevant_parts.append(f"RECALLED PREFERENCES:\n{sections['Preferences']}")
+            
+        # Rule 3: Continuation/Status -> Open Threads
+        cont_keywords = ["continue", "what about", "status", "next", "todo", "progress", "unfinished"]
+        if any(kw in user_input_lower for kw in cont_keywords) and sections["Open Threads"]:
+            relevant_parts.append(f"RECALLED OPEN THREADS:\n{sections['Open Threads']}")
+            
+        return "\n\n".join(relevant_parts)
+
 # Global instance
 memory_manager = MemoryManager()
