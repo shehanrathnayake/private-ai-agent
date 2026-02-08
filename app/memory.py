@@ -10,7 +10,8 @@ from sentence_transformers import SentenceTransformer
 from app.config import (
     OPENROUTER_API_KEY, VECTOR_DB_PATH, EMBEDDING_MODEL, EMBEDDING_DIMENSION,
     SIMILARITY_THRESHOLD, TOP_K_ASSOCIATIVE, IDENTITY_UPDATE_INTERVAL,
-    DECAY_LAMBDA
+    DECAY_LAMBDA, REINFORCE_AMOUNT_ASSOCIATIVE, REINFORCE_AMOUNT_DETERMINISTIC,
+    MAX_SALIENCE, MIN_SALIENCE
 )
 
 DB_PATH = "memory/agent_memory.db"
@@ -57,9 +58,15 @@ class MemoryManager:
                     type TEXT,
                     content TEXT,
                     salience REAL,
-                    timestamp TEXT
+                    timestamp TEXT,
+                    last_accessed_at TEXT
                 )
             """)
+            # Migration check
+            cursor.execute("PRAGMA table_info(vector_metadata)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'last_accessed_at' not in columns:
+                cursor.execute("ALTER TABLE vector_metadata ADD COLUMN last_accessed_at TEXT")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS system_metadata (
                     key TEXT PRIMARY KEY,
@@ -195,6 +202,7 @@ class MemoryManager:
                         row = cursor.fetchone()
                         if row:
                             results.append({
+                                "vector_id": int(idx),
                                 "type": row[0],
                                 "content": row[1],
                                 "salience": row[2],
@@ -292,22 +300,39 @@ class MemoryManager:
                     sections[current_section] += line + "\n"
         return {k: v.strip() for k, v in sections.items()}
 
-    def get_relevant_memory(self, session_id: str, user_input: str) -> Dict[str, str]:
-        """Returns sections of the current session summary that are keyword-relevant."""
+    def get_relevant_memory(self, session_id: str, user_input: str) -> Dict[str, Any]:
+        """Returns sections of the current session summary that are keyword-relevant and their vector IDs."""
         summary_text = self.get_summary(session_id)
-        if not summary_text: return {}
+        if not summary_text: return {"sections": {}, "vector_ids": []}
         sections = self.parse_summary_sections(summary_text)
         results = {}
         ui_lower = user_input.lower()
         # Identity/Origin Keywords
         id_keywords = ["name", "who am i", "remember me", "identity", "creator", "develop", "built", "origin", "who are you"]
+        
+        recalled_types = []
         if any(kw in ui_lower for kw in id_keywords) and sections["Known Facts"]:
             results["Known Facts"] = sections["Known Facts"]
+            recalled_types.append("Known Facts")
         if any(kw in ui_lower for kw in ["preference", "like", "dislike", "favorite", "style", "prefer"]) and sections["Preferences"]:
             results["Preferences"] = sections["Preferences"]
+            recalled_types.append("Preferences")
         if any(kw in ui_lower for kw in ["continue", "what about", "status", "next", "todo", "progress", "unfinished"]) and sections["Open Threads"]:
             results["Open Threads"] = sections["Open Threads"]
-        return results
+            recalled_types.append("Open Threads")
+            
+        vector_ids = self.get_vector_ids_for_session(session_id, recalled_types)
+        return {"sections": results, "vector_ids": vector_ids}
+
+    def get_vector_ids_for_session(self, session_id: str, types: List[str]) -> List[int]:
+        """Returns all vector IDs for the given types in a specific session."""
+        if not types: return []
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            placeholders = ', '.join(['?'] * len(types))
+            query = f"SELECT vector_id FROM vector_metadata WHERE session_id = ? AND type IN ({placeholders})"
+            cursor.execute(query, [session_id] + types)
+            return [row[0] for row in cursor.fetchall()]
 
     def get_associative_memory(self, user_input: str, skip_content: List[str] = None, return_raw: bool = False) -> any:
         results = self.query_associative(user_input)
@@ -349,7 +374,7 @@ class MemoryManager:
         embedding_id = self._get_embedding(identity[:2000]) # Sample first 2k chars
         
         if all(v == 0.0 for v in embedding_ui) or all(v == 0.0 for v in embedding_id):
-            return {"content": "", "similarity": 0.0} if return_raw else ""
+            return {"content": "", "similarity": 0.0, "vector_ids": []} if return_raw else ""
             
         vec_ui = np.array([embedding_ui]).astype('float32')
         vec_id = np.array([embedding_id]).astype('float32')
@@ -359,7 +384,7 @@ class MemoryManager:
         sim = float(np.dot(vec_ui, vec_id.T)[0][0])
         
         if return_raw:
-            return {"content": identity, "similarity": sim}
+            return {"content": identity, "similarity": sim, "vector_ids": []} # Identity file has no direct vectors yet
 
         if sim >= SIMILARITY_THRESHOLD:
             print(f"[PHASE3] Identity injection triggered (Sim: {sim:.2f})")
@@ -461,18 +486,29 @@ class MemoryManager:
         with sqlite3.connect(METADATA_DB_PATH) as conn:
             cursor = conn.cursor()
             # Fetch vectors that are not protected (salience < 0.95)
-            cursor.execute("SELECT vector_id, type, salience, timestamp FROM vector_metadata WHERE salience < 0.95")
+            cursor.execute("SELECT vector_id, type, salience, timestamp, last_accessed_at FROM vector_metadata WHERE salience < 0.95")
             records = cursor.fetchall()
             
             decay_count = 0
-            for vid, mtype, salience, ts_str in records:
+            for vid, mtype, salience, ts_str, last_acc_str in records:
                 if not ts_str: continue
                 
                 try:
+                    # Issue 5: Skip decay for vectors reinforced since last decay run
+                    if last_acc_str and last_run:
+                        last_acc = datetime.fromisoformat(last_acc_str)
+                        if last_acc > last_run:
+                            print(f"[PHASE5] Skipping decay for recently accessed vector {vid}")
+                            continue
+
                     created_at = datetime.fromisoformat(ts_str)
+                    last_accessed = datetime.fromisoformat(last_acc_str) if last_acc_str else None
                     
-                    # Compute delta_days: time elapsed since the LATEST of (creation or last decay run)
+                    # Issue 4: Decay reference time = max(created_at, last_accessed_at, last_decay_run)
                     reference_time = max(created_at, last_run) if last_run else created_at
+                    if last_accessed:
+                        reference_time = max(reference_time, last_accessed)
+                        
                     delta_days = (now - reference_time).total_seconds() / 86400.0
                     
                     if delta_days <= 0: continue
@@ -501,11 +537,31 @@ class MemoryManager:
             
         # Update last run timestamp
         self._set_system_metadata("last_decay_run", now.isoformat())
-        
         if decay_count > 0:
             print(f"[PHASE5] Salience decay complete. Updated {decay_count} records.")
         else:
             print("[PHASE5] Salience decay complete. No changes needed.")
+
+    def reinforce_memory(self, vector_id: int, amount: float, source: str = "generic"):
+        """Gradually increases the salience of a memory, countering decay."""
+        try:
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT salience FROM vector_metadata WHERE vector_id = ?", (vector_id,))
+                row = cursor.fetchone()
+                if not row: return
+
+                current_salience = row[0]
+                new_salience = min(current_salience + amount, MAX_SALIENCE)
+                new_salience = round(new_salience, 4)
+
+                # Issue 4: Update last_accessed_at
+                now_str = datetime.now().isoformat()
+                cursor.execute("UPDATE vector_metadata SET salience = ?, last_accessed_at = ? WHERE vector_id = ?", (new_salience, now_str, vector_id))
+                conn.commit()
+                print(f"[PHASE5] Reinforced vector {vector_id} ({source}) (+{amount} -> {new_salience})")
+        except Exception as e:
+            print(f"[PHASE5] Reinforcement error: {e}")
 
 # Global instance
 memory_manager = MemoryManager()

@@ -3,7 +3,9 @@ import json
 from datetime import datetime
 from app.openrouter import run_openrouter
 from app.config import (
-    SYSTEM_PROMPT, SUMMARY_THRESHOLD, IDENTITY_UPDATE_INTERVAL
+    SYSTEM_PROMPT, SUMMARY_THRESHOLD, IDENTITY_UPDATE_INTERVAL,
+    REINFORCE_AMOUNT_ASSOCIATIVE, REINFORCE_AMOUNT_DETERMINISTIC,
+    REINFORCE_AMOUNT_IDENTITY
 )
 from app.memory import memory_manager
 
@@ -46,7 +48,10 @@ def run_agent(user_input: str, session_id: str) -> str:
     }
     
     # Phase 2: Deterministic Recall
-    relevant_sections = memory_manager.get_relevant_memory(session_id, user_input)
+    # Phase 2: Deterministic Recall
+    relevant_res = memory_manager.get_relevant_memory(session_id, user_input)
+    relevant_sections = relevant_res["sections"]
+    deterministic_vector_ids = relevant_res["vector_ids"]
     trace["deterministic"] = {k: True for k in relevant_sections.keys()}
     
     # Phase 3: Associative Recall (with confidence gating)
@@ -54,25 +59,33 @@ def run_agent(user_input: str, session_id: str) -> str:
     raw_associative = memory_manager.get_associative_memory(user_input, skip_content=skip_content, return_raw=True)
     
     associative_injections = []
+    used_associative_vector_ids = []
     for mem in raw_associative:
         sim = mem['similarity']
         trace["associative"].append({"content": mem['content'][:50], "sim": sim, "type": mem['type']})
         if sim >= 0.85:
             associative_injections.append(f"[{mem['type']}]: {mem['content']}")
+            used_associative_vector_ids.append(mem['vector_id'])
         elif sim >= 0.70:
             associative_injections.append(f"[{mem['type']} (Potential Match)]: I recall something similar - {mem['content']}")
+            used_associative_vector_ids.append(mem['vector_id'])
             
     # Phase 3: Identity-Aware Recall
     id_res = memory_manager.get_identity(user_input, return_raw=True)
     trace["identity"] = {"score": id_res['similarity']}
     identity_prompt = ""
+    identity_vector_ids = id_res.get("vector_ids", [])
+    used_identity_vector_ids = []
+    
     if id_res['similarity'] >= 0.85:
         identity_prompt = f"IDENTITY (Self-Model):\n{id_res['content']}"
         trace["identity"]["triggered"] = True
+        used_identity_vector_ids = identity_vector_ids
     elif id_res['similarity'] >= 0.70:
         identity_prompt = f"IDENTITY (Potential Preference Match):\nNote: The user may prefer - {id_res['content']}"
         trace["identity"]["triggered"] = True
         trace["identity"]["hedged"] = True
+        used_identity_vector_ids = identity_vector_ids
 
     knowledge = memory_manager.get_knowledge()
     
@@ -173,7 +186,17 @@ def run_agent(user_input: str, session_id: str) -> str:
     LAST_TRACE = trace 
     memory_manager.add_message(session_id, "assistant", final_output)
     
-    # 8. Periodic Maintenance
+    # 8. Phase 5.2: Memory Reinforcement
+    # Reinforce memories that were successfully recalled and used this turn
+    # Use sets to avoid duplicate reinforcement in the same turn (Issue 6)
+    for vid in set(used_associative_vector_ids):
+        memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_ASSOCIATIVE, source="associative")
+    for vid in set(deterministic_vector_ids):
+        memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_DETERMINISTIC, source="deterministic")
+    for vid in set(used_identity_vector_ids):
+        memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_IDENTITY, source="identity")
+
+    # 9. Periodic Maintenance
     try:
         msg_count = memory_manager.get_message_count(session_id)
         if msg_count > 0 and msg_count % SUMMARY_THRESHOLD == 0:
