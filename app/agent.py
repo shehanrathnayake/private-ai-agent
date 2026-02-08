@@ -180,8 +180,11 @@ def run_agent(user_input: str, session_id: str) -> str:
             print(f"[MEMORY] Maintenance cycle triggered ({msg_count} msgs)")
             summarize_session(session_id)
             memory_manager.detect_drift(session_id)
-            summary_files = [f for f in os.listdir("memory/summaries") if f.endswith(".md")]
-            if len(summary_files) > 0 and len(summary_files) % IDENTITY_UPDATE_INTERVAL == 0:
+            memory_manager.decay_salience()
+            
+            # Identity formation triggers based on total summary volume (experience), not file count.
+            update_count = memory_manager.get_summary_update_count()
+            if update_count > 0 and update_count % IDENTITY_UPDATE_INTERVAL == 0:
                 memory_manager.update_identity()
     except Exception as e:
         print(f"[MEMORY] Maintenance Error: {e}")

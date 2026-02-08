@@ -2,13 +2,15 @@ import sqlite3
 import os
 import json
 import numpy as np
+import math
 import faiss
 from datetime import datetime
 from typing import List, Dict, Optional
 from sentence_transformers import SentenceTransformer
 from app.config import (
     OPENROUTER_API_KEY, VECTOR_DB_PATH, EMBEDDING_MODEL, EMBEDDING_DIMENSION,
-    SIMILARITY_THRESHOLD, TOP_K_ASSOCIATIVE, IDENTITY_UPDATE_INTERVAL
+    SIMILARITY_THRESHOLD, TOP_K_ASSOCIATIVE, IDENTITY_UPDATE_INTERVAL,
+    DECAY_LAMBDA
 )
 
 DB_PATH = "memory/agent_memory.db"
@@ -58,6 +60,12 @@ class MemoryManager:
                     timestamp TEXT
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS system_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
             conn.commit()
             
         # Initialize FAISS index
@@ -91,6 +99,19 @@ class MemoryManager:
         except Exception as e:
             print(f"[PHASE3] Failed to load index: {e}. Starting fresh.")
             self.index = faiss.IndexFlatL2(self.dimension)
+
+    def _get_system_metadata(self, key: str, default: str = None) -> str:
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM system_metadata WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row[0] if row else default
+
+    def _set_system_metadata(self, key: str, value: str):
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO system_metadata (key, value) VALUES (?, ?)", (key, value))
+            conn.commit()
 
     def _get_model(self):
         if self.model is None:
@@ -243,6 +264,13 @@ class MemoryManager:
                 # (Simple check: last 5 vectors for this type)
                 salience = 0.9 if sec_type == "Open Threads" else 0.5
                 self.add_vector(content, session_id, sec_type, salience)
+        
+        # Increment summary update count for Phase 5 identity triggering
+        count = int(self._get_system_metadata("summary_update_count", "0"))
+        self._set_system_metadata("summary_update_count", str(count + 1))
+
+    def get_summary_update_count(self) -> int:
+        return int(self._get_system_metadata("summary_update_count", "0"))
 
     def get_knowledge(self) -> str:
         knowledge_file = "memory/knowledge.md"
@@ -271,7 +299,9 @@ class MemoryManager:
         sections = self.parse_summary_sections(summary_text)
         results = {}
         ui_lower = user_input.lower()
-        if any(kw in ui_lower for kw in ["name", "who am i", "remember me", "identity"]) and sections["Known Facts"]:
+        # Identity/Origin Keywords
+        id_keywords = ["name", "who am i", "remember me", "identity", "creator", "develop", "built", "origin", "who are you"]
+        if any(kw in ui_lower for kw in id_keywords) and sections["Known Facts"]:
             results["Known Facts"] = sections["Known Facts"]
         if any(kw in ui_lower for kw in ["preference", "like", "dislike", "favorite", "style", "prefer"]) and sections["Preferences"]:
             results["Preferences"] = sections["Preferences"]
@@ -392,12 +422,11 @@ class MemoryManager:
         if os.path.exists(IDENTITY_FILE_PATH):
             with open(IDENTITY_FILE_PATH, "r", encoding="utf-8") as f:
                 identity = f.read().lower()
-            
             for section, content in sections.items():
                 if "no" in content.lower() and "yes" in identity:
                     # Very primitive example of detection
                     pass
-
+        
         # 2. Long-lived Open Threads
         if sections["Open Threads"]:
             thread_count = sections["Open Threads"].count("-")
@@ -411,6 +440,72 @@ class MemoryManager:
             repeats = cursor.fetchall()
             for r in repeats:
                 print(f"[PHASE3.5] WARNING: Redundant memory detected ({r[1]} instances): {r[0][:50]}...")
+
+    def decay_salience(self):
+        """Implements time-based salience decay for associative memory using delta time."""
+        print("[PHASE5] Starting salience decay process...")
+        now = datetime.now()
+        
+        # Get last decay run
+        last_run_str = self._get_system_metadata("last_decay_run")
+        last_run = datetime.fromisoformat(last_run_str) if last_run_str else None
+        
+        # Decay Multipliers per Requirement
+        multipliers = {
+            "Open Threads": 0.5,
+            "Preferences": 1.0,
+            "Known Facts": 1.2,
+            "Tool History": 1.5
+        }
+        
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            # Fetch vectors that are not protected (salience < 0.95)
+            cursor.execute("SELECT vector_id, type, salience, timestamp FROM vector_metadata WHERE salience < 0.95")
+            records = cursor.fetchall()
+            
+            decay_count = 0
+            for vid, mtype, salience, ts_str in records:
+                if not ts_str: continue
+                
+                try:
+                    created_at = datetime.fromisoformat(ts_str)
+                    
+                    # Compute delta_days: time elapsed since the LATEST of (creation or last decay run)
+                    reference_time = max(created_at, last_run) if last_run else created_at
+                    delta_days = (now - reference_time).total_seconds() / 86400.0
+                    
+                    if delta_days <= 0: continue
+                    
+                    multiplier = multipliers.get(mtype, 1.0)
+                    effective_lambda = DECAY_LAMBDA * multiplier
+                    
+                    # Formula: decayed_salience = current_salience * exp(-λ * delta_days)
+                    new_salience = salience * math.exp(-effective_lambda * delta_days)
+                    
+                    # Floor check
+                    if new_salience < 0.05:
+                        new_salience = 0.05
+                    
+                    new_salience = round(new_salience, 4)
+                    
+                    if new_salience != salience:
+                        cursor.execute("UPDATE vector_metadata SET salience = ? WHERE vector_id = ?", (new_salience, vid))
+                        print(f"[PHASE5] Decayed vector {vid} ({mtype}): {salience} -> {new_salience} (delta: {delta_days:.4f} days)")
+                        decay_count += 1
+                        
+                except (ValueError, TypeError):
+                    continue
+            
+            conn.commit()
+            
+        # Update last run timestamp
+        self._set_system_metadata("last_decay_run", now.isoformat())
+        
+        if decay_count > 0:
+            print(f"[PHASE5] Salience decay complete. Updated {decay_count} records.")
+        else:
+            print("[PHASE5] Salience decay complete. No changes needed.")
 
 # Global instance
 memory_manager = MemoryManager()

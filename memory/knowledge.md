@@ -13,4 +13,5 @@
 - Comfortable with architectural discussions
 
 ## Environment Facts
-- This AI agent is a private assistant used on a local LAN
+- This AI agent is a private assistant developed and used locally by Shehan.
+- All development and deployment were handled by Shehan.
