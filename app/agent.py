@@ -13,19 +13,22 @@ def run_agent(user_input: str, session_id: str) -> str:
     # 2. Retrieve history and context
     history = memory_manager.get_history(session_id, limit=10)
     
-    # Phase 2: Deterministic Recall
-    relevant_memory = memory_manager.get_relevant_memory(session_id, user_input)
+    # Phase 2: Deterministic Recall (Keyword-based)
+    # Returns a dict of relevant sections
+    relevant_sections = memory_manager.get_relevant_memory(session_id, user_input)
     
-    # Phase 3: Associative Recall
-    associative_memory = memory_manager.get_associative_memory(user_input)
+    # Phase 3: Associative Recall (Semantic-based)
+    # We pass the content already found in Phase 2 to avoid duplication
+    skip_content = list(relevant_sections.values())
+    associative_memory = memory_manager.get_associative_memory(user_input, skip_content=skip_content)
     
-    # Phase 3: Identity-Aware Recall
+    # Phase 3: Identity-Aware Recall (Semantic relevance to identity.md)
     identity = memory_manager.get_identity(user_input)
     
-    # Core Knowledge
+    # Core Knowledge (Permanent facts)
     knowledge = memory_manager.get_knowledge()
     
-    # 3. Build the prompt with memory
+    # 3. Build the prompt with layered memory
     prompt_sections = [SYSTEM_PROMPT]
     
     if knowledge:
@@ -34,8 +37,9 @@ def run_agent(user_input: str, session_id: str) -> str:
     if identity:
         prompt_sections.append(identity)
         
-    if relevant_memory:
-        prompt_sections.append(f"RELEVANT SESSION MEMORY:\n{relevant_memory}")
+    if relevant_sections:
+        relevant_text = "\n\n".join([f"RECALLED {k.upper()}:\n{v}" for k, v in relevant_sections.items()])
+        prompt_sections.append(f"RELEVANT SESSION MEMORY:\n{relevant_text}")
         
     if associative_memory:
         prompt_sections.append(associative_memory)
@@ -45,7 +49,7 @@ def run_agent(user_input: str, session_id: str) -> str:
         role_label = "Assistant" if msg["role"] == "assistant" else "User"
         prompt_sections.append(f"{role_label}: {msg['content']}")
         
-    # We add the final indicator for the LLM
+    # Final indicator
     prompt_sections.append("Assistant:")
     
     full_prompt = "\n\n".join(prompt_sections)
@@ -56,22 +60,20 @@ def run_agent(user_input: str, session_id: str) -> str:
     # 5. Save assistant response to SQLite
     memory_manager.add_message(session_id, "assistant", agent_response)
     
-    # 6. Periodic Auto-summarization (Every N messages)
+    # 6. Periodic Maintenance (Every N messages)
     try:
         msg_count = memory_manager.get_message_count(session_id)
         if msg_count > 0 and msg_count % SUMMARY_THRESHOLD == 0:
-            print(f"[MEMORY] Summarization triggered for session {session_id} (count: {msg_count})")
+            print(f"[MEMORY] Periodic maintenance triggered (count: {msg_count})")
             summarize_session(session_id)
             
-            # Phase 3: Identity update interval
-            # We check total summary files to decide if it's time for an identity merge
+            # Phase 3: Identity maintenance
             summary_files = [f for f in os.listdir("memory/summaries") if f.endswith(".md")]
             if len(summary_files) > 0 and len(summary_files) % IDENTITY_UPDATE_INTERVAL == 0:
                 memory_manager.update_identity()
                 
     except Exception as e:
-        # Safety: Log the error and continue normally
-        print(f"[MEMORY] Summarization/Identity error: {e}")
+        print(f"[MEMORY] Maintenance error: {e}")
         
     return agent_response
 

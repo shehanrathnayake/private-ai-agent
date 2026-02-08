@@ -24,8 +24,11 @@ class MemoryManager:
         if not os.path.exists(SUMMARIES_PATH):
             os.makedirs(SUMMARIES_PATH)
         
-        # Initialize OpenAI client for embeddings
-        self.client = OpenAI(api_key=OPENROUTER_API_KEY) # Using same key for convenience
+        # Initialize OpenAI client pointed to OpenRouter for embeddings
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY
+        )
 
     def _init_db(self):
         with sqlite3.connect(DB_PATH) as conn:
@@ -61,15 +64,30 @@ class MemoryManager:
             conn.commit()
             
         # Initialize FAISS index
-        # text-embedding-3-small dimension is 1536
         self.dimension = 1536
-        if os.path.exists(VECTOR_INDEX_PATH):
-            self.index = faiss.read_index(VECTOR_INDEX_PATH)
-        else:
+        try:
+            if os.path.exists(VECTOR_INDEX_PATH):
+                self.index = faiss.read_index(VECTOR_INDEX_PATH)
+                # Verify sync between SQLite and FAISS
+                with sqlite3.connect(METADATA_DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM vector_metadata")
+                    db_count = cursor.fetchone()[0]
+                    if db_count != self.index.ntotal:
+                        print(f"[PHASE3] WARNING: Vector mismatch (DB: {db_count}, FAISS: {self.index.ntotal}). Re-initializing index.")
+                        self.index = faiss.IndexFlatL2(self.dimension)
+                        cursor.execute("DELETE FROM vector_metadata")
+                        conn.commit()
+            else:
+                self.index = faiss.IndexFlatL2(self.dimension)
+        except Exception as e:
+            print(f"[PHASE3] Failed to load index: {e}")
             self.index = faiss.IndexFlatL2(self.dimension)
 
     def _get_embedding(self, text: str) -> List[float]:
         try:
+            # Simple sanitization
+            text = text.replace("\n", " ")
             response = self.client.embeddings.create(
                 input=text,
                 model=EMBEDDING_MODEL
@@ -80,54 +98,68 @@ class MemoryManager:
             return [0.0] * self.dimension
 
     def add_vector(self, text: str, session_id: str, mem_type: str, salience: float = 0.5):
+        if not text.strip(): return
+        
         embedding = self._get_embedding(text)
         if all(v == 0.0 for v in embedding):
             return
             
-        vector = np.array([embedding]).astype('float32')
-        faiss.normalize_L2(vector) # Use cosine similarity via normalized L2
-        
-        vector_id = self.index.ntotal
-        self.index.add(vector)
-        faiss.write_index(self.index, VECTOR_INDEX_PATH)
-        
-        with sqlite3.connect(METADATA_DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO vector_metadata (vector_id, session_id, type, content, salience, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                (vector_id, session_id, mem_type, text, salience, datetime.now().isoformat())
-            )
-            conn.commit()
-        print(f"[PHASE3] Vector added: Type={mem_type}, Salience={salience}")
+        try:
+            vector = np.array([embedding]).astype('float32')
+            faiss.normalize_L2(vector)
+            
+            vector_id = self.index.ntotal
+            self.index.add(vector)
+            faiss.write_index(self.index, VECTOR_INDEX_PATH)
+            
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO vector_metadata (vector_id, session_id, type, content, salience, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                    (vector_id, session_id, mem_type, text, salience, datetime.now().isoformat())
+                )
+                conn.commit()
+            print(f"[PHASE3] Vector {vector_id} added: Type={mem_type}, Salience={salience}")
+        except Exception as e:
+            print(f"[PHASE3] Error adding vector: {e}")
 
     def query_associative(self, query_text: str, top_k: int = TOP_K_ASSOCIATIVE) -> List[Dict]:
+        if not query_text.strip(): return []
+        
         embedding = self._get_embedding(query_text)
         if all(v == 0.0 for v in embedding):
             return []
             
-        vector = np.array([embedding]).astype('float32')
-        faiss.normalize_L2(vector)
-        
-        distances, indices = self.index.search(vector, top_k)
-        
-        results = []
-        with sqlite3.connect(METADATA_DB_PATH) as conn:
-            cursor = conn.cursor()
-            for i, idx in enumerate(indices[0]):
-                if idx == -1: continue
-                # In normalized L2, distance = 2 * (1 - cosine_similarity)
-                similarity = 1 - (distances[0][i] / 2)
-                if similarity >= SIMILARITY_THRESHOLD:
-                    cursor.execute("SELECT type, content, salience FROM vector_metadata WHERE vector_id = ?", (int(idx),))
-                    row = cursor.fetchone()
-                    if row:
-                        results.append({
-                            "type": row[0],
-                            "content": row[1],
-                            "salience": row[2],
-                            "similarity": similarity
-                        })
-        return results
+        try:
+            vector = np.array([embedding]).astype('float32')
+            faiss.normalize_L2(vector)
+            
+            distances, indices = self.index.search(vector, top_k)
+            
+            results = []
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                for i, idx in enumerate(indices[0]):
+                    if idx == -1: continue
+                    # normalized L2 distance to similarity
+                    similarity = 1 - (distances[0][i] / 2)
+                    if similarity >= SIMILARITY_THRESHOLD:
+                        cursor.execute("SELECT type, content, salience FROM vector_metadata WHERE vector_id = ?", (int(idx),))
+                        row = cursor.fetchone()
+                        if row:
+                            results.append({
+                                "type": row[0],
+                                "content": row[1],
+                                "salience": row[2],
+                                "similarity": float(similarity)
+                            })
+            
+            # Sort by salience then similarity
+            results.sort(key=lambda x: (x['salience'], x['similarity']), reverse=True)
+            return results
+        except Exception as e:
+            print(f"[PHASE3] Query error: {e}")
+            return []
 
     def add_message(self, session_id: str, role: str, content: str):
         with sqlite3.connect(DB_PATH) as conn:
@@ -181,7 +213,9 @@ class MemoryManager:
         for sec_type, content in sections.items():
             if content:
                 # Salience logic: Open Threads get higher base salience
-                salience = 0.8 if sec_type == "Open Threads" else 0.5
+                # Also, check if this content already exists to avoid redundant vectors
+                # (Simple check: last 5 vectors for this type)
+                salience = 0.9 if sec_type == "Open Threads" else 0.5
                 self.add_vector(content, session_id, sec_type, salience)
 
     def get_knowledge(self) -> str:
@@ -204,56 +238,80 @@ class MemoryManager:
                     sections[current_section] += line + "\n"
         return {k: v.strip() for k, v in sections.items()}
 
-    def get_relevant_memory(self, session_id: str, user_input: str) -> str:
+    def get_relevant_memory(self, session_id: str, user_input: str) -> Dict[str, str]:
+        """Returns sections of the current session summary that are keyword-relevant."""
         summary_text = self.get_summary(session_id)
-        if not summary_text: return ""
+        if not summary_text: return {}
         sections = self.parse_summary_sections(summary_text)
-        relevant_parts = []
+        results = {}
         ui_lower = user_input.lower()
         if any(kw in ui_lower for kw in ["name", "who am i", "remember me", "identity"]) and sections["Known Facts"]:
-            relevant_parts.append(f"RECALLED KNOWN FACTS:\n{sections['Known Facts']}")
+            results["Known Facts"] = sections["Known Facts"]
         if any(kw in ui_lower for kw in ["preference", "like", "dislike", "favorite", "style", "prefer"]) and sections["Preferences"]:
-            relevant_parts.append(f"RECALLED PREFERENCES:\n{sections['Preferences']}")
+            results["Preferences"] = sections["Preferences"]
         if any(kw in ui_lower for kw in ["continue", "what about", "status", "next", "todo", "progress", "unfinished"]) and sections["Open Threads"]:
-            relevant_parts.append(f"RECALLED OPEN THREADS:\n{sections['Open Threads']}")
-        return "\n\n".join(relevant_parts)
+            results["Open Threads"] = sections["Open Threads"]
+        return results
 
-    def get_associative_memory(self, user_input: str) -> str:
+    def get_associative_memory(self, user_input: str, skip_content: List[str] = None) -> str:
         results = self.query_associative(user_input)
-        if not results: return ""
+        if not results:
+            print("[PHASE3] Associative search: No results above threshold.")
+            return ""
+            
+        skip_content = skip_content or []
         output = ["[PHASE3] ASSOCIATIVE MEMORIES:"]
+        count = 0
         for res in results:
-            output.append(f"[{res['type']}] (Salience: {res['salience']}): {res['content']}")
+            # Avoid direct duplicates from Phase 2
+            is_duplicate = any(res['content'] in skip for skip in skip_content)
+            if not is_duplicate:
+                output.append(f"[{res['type']}] (Salience: {res['salience']}): {res['content']}")
+                count += 1
+        
+        if count == 0:
+            return ""
+            
+        print(f"[PHASE3] Associative search: {count} matches.")
         return "\n".join(output)
 
     def get_identity(self, user_input: str) -> str:
         if not os.path.exists(IDENTITY_FILE_PATH): return ""
-        with open(IDENTITY_FILE_PATH, "r") as f:
+        with open(IDENTITY_FILE_PATH, "r", encoding="utf-8") as f:
             identity = f.read()
         
         # Identity-aware recall: only if semantic relevance is high
         embedding_ui = self._get_embedding(user_input)
         embedding_id = self._get_embedding(identity[:2000]) # Sample first 2k chars
         
+        if all(v == 0.0 for v in embedding_ui) or all(v == 0.0 for v in embedding_id):
+            return ""
+            
         vec_ui = np.array([embedding_ui]).astype('float32')
         vec_id = np.array([embedding_id]).astype('float32')
         faiss.normalize_L2(vec_ui)
         faiss.normalize_L2(vec_id)
         
-        sim = np.dot(vec_ui, vec_id.T)[0][0]
+        sim = float(np.dot(vec_ui, vec_id.T)[0][0])
         if sim >= SIMILARITY_THRESHOLD:
             print(f"[PHASE3] Identity injection triggered (Sim: {sim:.2f})")
             return f"IDENTITY (Self-Model):\n{identity}"
+        
+        print(f"[PHASE3] Identity skipped (Sim: {sim:.2f})")
         return ""
 
     def update_identity(self):
         """Merges patterns from multiple summaries into the identity.md."""
         print("[PHASE3] Updating Identity self-model...")
         all_summaries = []
-        for filename in os.listdir(SUMMARIES_PATH):
-            if filename.endswith(".md"):
-                with open(os.path.join(SUMMARIES_PATH, filename), "r") as f:
-                    all_summaries.append(f.read())
+        try:
+            for filename in os.listdir(SUMMARIES_PATH):
+                if filename.endswith(".md"):
+                    with open(os.path.join(SUMMARIES_PATH, filename), "r", encoding="utf-8") as f:
+                        all_summaries.append(f.read())
+        except Exception as e:
+            print(f"[PHASE3] Error reading summaries for identity: {e}")
+            return
         
         if not all_summaries: return
 
@@ -277,9 +335,11 @@ class MemoryManager:
         """
         new_identity = run_openrouter(merge_prompt)
         if not new_identity.startswith("Error"):
-            with open(IDENTITY_FILE_PATH, "w") as f:
+            with open(IDENTITY_FILE_PATH, "w", encoding="utf-8") as f:
                 f.write(new_identity)
             print("[PHASE3] Identity updated successfully.")
+        else:
+            print(f"[PHASE3] Identity update failed: {new_identity}")
 
 # Global instance
 memory_manager = MemoryManager()
