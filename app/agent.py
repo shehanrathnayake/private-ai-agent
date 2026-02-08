@@ -6,74 +6,122 @@ from app.config import (
 )
 from app.memory import memory_manager
 
+# global trace for debugging
+LAST_TRACE = {}
+
 def run_agent(user_input: str, session_id: str) -> str:
-    # 1. Save user message to SQLite
+    global LAST_TRACE
+    
+    # 1. Intercept Debug Commands
+    if user_input.startswith("/debug "):
+        cmd = user_input.split(" ")[1].lower()
+        if cmd == "memory":
+            summary = memory_manager.get_summary(session_id)
+            identity = ""
+            if os.path.exists("memory/identity.md"):
+                with open("memory/identity.md", "r") as f: identity = f.read()
+            return f"[DEBUG MEMORY]\n\nSESSION SUMMARY:\n{summary}\n\nIDENTITY:\n{identity}"
+        
+        elif cmd == "trace":
+            return f"[DEBUG TRACE]\n\n{json.dumps(LAST_TRACE, indent=2)}"
+            
+        elif cmd == "identity":
+            res = memory_manager.get_identity(user_input, return_raw=True)
+            return f"[DEBUG IDENTITY]\n\nSimilarity Score: {res['similarity']:.4f}\n\nContent:\n{res['content']}"
+
+    # 2. Save user message to SQLite
     memory_manager.add_message(session_id, "user", user_input)
     
-    # 2. Retrieve history and context
-    history = memory_manager.get_history(session_id, limit=10)
+    # 3. Memory Trace Collection & Injection
+    trace = {
+        "timestamp": datetime.now().isoformat(),
+        "input": user_input,
+        "deterministic": {},
+        "associative": [],
+        "identity": {"triggered": False, "score": 0.0}
+    }
     
-    # Phase 2: Deterministic Recall (Keyword-based)
-    # Returns a dict of relevant sections
+    # Phase 2: Deterministic Recall
     relevant_sections = memory_manager.get_relevant_memory(session_id, user_input)
+    trace["deterministic"] = {k: True for k in relevant_sections.keys()}
     
-    # Phase 3: Associative Recall (Semantic-based)
-    # We pass the content already found in Phase 2 to avoid duplication
+    # Phase 3: Associative Recall (with confidence gating)
     skip_content = list(relevant_sections.values())
-    associative_memory = memory_manager.get_associative_memory(user_input, skip_content=skip_content)
+    raw_associative = memory_manager.get_associative_memory(user_input, skip_content=skip_content, return_raw=True)
     
-    # Phase 3: Identity-Aware Recall (Semantic relevance to identity.md)
-    identity = memory_manager.get_identity(user_input)
-    
-    # Core Knowledge (Permanent facts)
+    associative_injections = []
+    for mem in raw_associative:
+        sim = mem['similarity']
+        trace["associative"].append({"content": mem['content'][:50], "sim": sim, "type": mem['type']})
+        
+        # Confidence Gating & Hedging
+        if sim >= 0.85:
+            associative_injections.append(f"[{mem['type']}]: {mem['content']}")
+        elif sim >= 0.70:
+            associative_injections.append(f"[{mem['type']} (Potential Match)]: I recall something similar - {mem['content']}")
+            
+    # Phase 3: Identity-Aware Recall
+    id_res = memory_manager.get_identity(user_input, return_raw=True)
+    trace["identity"] = {"score": id_res['similarity']}
+    identity_prompt = ""
+    if id_res['similarity'] >= 0.85:
+        identity_prompt = f"IDENTITY (Self-Model):\n{id_res['content']}"
+        trace["identity"]["triggered"] = True
+    elif id_res['similarity'] >= 0.70:
+        identity_prompt = f"IDENTITY (Potential Preference Match):\nNote: The user may prefer - {id_res['content']}"
+        trace["identity"]["triggered"] = True
+        trace["identity"]["hedged"] = True
+
     knowledge = memory_manager.get_knowledge()
+    LAST_TRACE = trace # Save for /debug trace
     
-    # 3. Build the prompt with layered memory
+    # 4. Build the prompt
     prompt_sections = [SYSTEM_PROMPT]
     
     if knowledge:
         prompt_sections.append(f"CORE KNOWLEDGE:\n{knowledge}")
     
-    if identity:
-        prompt_sections.append(identity)
+    if identity_prompt:
+        prompt_sections.append(identity_prompt)
         
     if relevant_sections:
         relevant_text = "\n\n".join([f"RECALLED {k.upper()}:\n{v}" for k, v in relevant_sections.items()])
         prompt_sections.append(f"RELEVANT SESSION MEMORY:\n{relevant_text}")
         
-    if associative_memory:
-        prompt_sections.append(associative_memory)
+    if associative_injections:
+        prompt_sections.append("[PHASE3] ASSOCIATIVE MEMORIES:\n" + "\n".join(associative_injections))
         
+    # 5. History & Finish Prompt
+    history = memory_manager.get_history(session_id, limit=10)
     prompt_sections.append("CONVERSATION HISTORY:")
     for msg in history:
         role_label = "Assistant" if msg["role"] == "assistant" else "User"
         prompt_sections.append(f"{role_label}: {msg['content']}")
         
-    # Final indicator
     prompt_sections.append("Assistant:")
-    
     full_prompt = "\n\n".join(prompt_sections)
     
-    # 4. Get response from LLM
+    # 6. Get Response
     agent_response = run_openrouter(full_prompt)
-    
-    # 5. Save assistant response to SQLite
     memory_manager.add_message(session_id, "assistant", agent_response)
     
-    # 6. Periodic Maintenance (Every N messages)
+    # 7. Periodic Maintenance
     try:
         msg_count = memory_manager.get_message_count(session_id)
         if msg_count > 0 and msg_count % SUMMARY_THRESHOLD == 0:
-            print(f"[MEMORY] Periodic maintenance triggered (count: {msg_count})")
+            print(f"[MEMORY] Maintenance cycle triggered ({msg_count} msgs)")
             summarize_session(session_id)
             
-            # Phase 3: Identity maintenance
+            # Drift detection (Observational)
+            memory_manager.detect_drift(session_id)
+            
+            # Identity maintenance
             summary_files = [f for f in os.listdir("memory/summaries") if f.endswith(".md")]
             if len(summary_files) > 0 and len(summary_files) % IDENTITY_UPDATE_INTERVAL == 0:
                 memory_manager.update_identity()
                 
     except Exception as e:
-        print(f"[MEMORY] Maintenance error: {e}")
+        print(f"[MEMORY] Maintenance failure: {e}")
         
     return agent_response
 

@@ -259,30 +259,38 @@ class MemoryManager:
             results["Open Threads"] = sections["Open Threads"]
         return results
 
-    def get_associative_memory(self, user_input: str, skip_content: List[str] = None) -> str:
+    def get_associative_memory(self, user_input: str, skip_content: List[str] = None, return_raw: bool = False) -> any:
         results = self.query_associative(user_input)
         if not results:
             print("[PHASE3] Associative search: No results above threshold.")
-            return ""
+            return [] if return_raw else ""
             
         skip_content = skip_content or []
-        output = ["[PHASE3] ASSOCIATIVE MEMORIES:"]
         count = 0
+        output_results = []
         for res in results:
             # Avoid direct duplicates from Phase 2
             is_duplicate = any(res['content'] in skip for skip in skip_content)
             if not is_duplicate:
-                output.append(f"[{res['type']}] (Salience: {res['salience']}): {res['content']}")
+                output_results.append(res)
                 count += 1
         
+        if return_raw:
+            return output_results
+
         if count == 0:
             return ""
             
         print(f"[PHASE3] Associative search: {count} matches.")
+        output = ["[PHASE3] ASSOCIATIVE MEMORIES:"]
+        for res in output_results:
+            output.append(f"[{res['type']}] (Salience: {res['salience']}): {res['content']}")
         return "\n".join(output)
 
-    def get_identity(self, user_input: str) -> str:
-        if not os.path.exists(IDENTITY_FILE_PATH): return ""
+    def get_identity(self, user_input: str, return_raw: bool = False) -> any:
+        if not os.path.exists(IDENTITY_FILE_PATH): 
+            return {"content": "", "similarity": 0.0} if return_raw else ""
+        
         with open(IDENTITY_FILE_PATH, "r", encoding="utf-8") as f:
             identity = f.read()
         
@@ -291,7 +299,7 @@ class MemoryManager:
         embedding_id = self._get_embedding(identity[:2000]) # Sample first 2k chars
         
         if all(v == 0.0 for v in embedding_ui) or all(v == 0.0 for v in embedding_id):
-            return ""
+            return {"content": "", "similarity": 0.0} if return_raw else ""
             
         vec_ui = np.array([embedding_ui]).astype('float32')
         vec_id = np.array([embedding_id]).astype('float32')
@@ -299,6 +307,10 @@ class MemoryManager:
         faiss.normalize_L2(vec_id)
         
         sim = float(np.dot(vec_ui, vec_id.T)[0][0])
+        
+        if return_raw:
+            return {"content": identity, "similarity": sim}
+
         if sim >= SIMILARITY_THRESHOLD:
             print(f"[PHASE3] Identity injection triggered (Sim: {sim:.2f})")
             return f"IDENTITY (Self-Model):\n{identity}"
@@ -346,6 +358,39 @@ class MemoryManager:
             print("[PHASE3] Identity updated successfully.")
         else:
             print(f"[PHASE3] Identity update failed: {new_identity}")
+
+    def detect_drift(self, session_id: str):
+        """Logged-only drift detection for consistency monitoring."""
+        print(f"[PHASE3.5] Scanning for drift in session {session_id}...")
+        
+        summary = self.get_summary(session_id)
+        if not summary: return
+        
+        sections = self.parse_summary_sections(summary)
+        
+        # 1. Contradiction Check (Simple keyword search against identity)
+        if os.path.exists(IDENTITY_FILE_PATH):
+            with open(IDENTITY_FILE_PATH, "r", encoding="utf-8") as f:
+                identity = f.read().lower()
+            
+            for section, content in sections.items():
+                if "no" in content.lower() and "yes" in identity:
+                    # Very primitive example of detection
+                    pass
+
+        # 2. Long-lived Open Threads
+        if sections["Open Threads"]:
+            thread_count = sections["Open Threads"].count("-")
+            if thread_count > 5:
+                print(f"[PHASE3.5] WARNING: High thread count ({thread_count}). Possible drift in resolution logic.")
+        
+        # 3. Repeated Content Detection (Check metadata DB)
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT content, COUNT(*) as c FROM vector_metadata GROUP BY content HAVING c > 1")
+            repeats = cursor.fetchall()
+            for r in repeats:
+                print(f"[PHASE3.5] WARNING: Redundant memory detected ({r[1]} instances): {r[0][:50]}...")
 
 # Global instance
 memory_manager = MemoryManager()
