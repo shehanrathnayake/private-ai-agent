@@ -1,10 +1,13 @@
 import os
+import json
 from datetime import datetime
 from app.openrouter import run_openrouter
 from app.config import (
     SYSTEM_PROMPT, SUMMARY_THRESHOLD, IDENTITY_UPDATE_INTERVAL
 )
 from app.memory import memory_manager
+
+from app.tools import tool_manager
 
 # global trace for debugging
 LAST_TRACE = {}
@@ -38,7 +41,8 @@ def run_agent(user_input: str, session_id: str) -> str:
         "input": user_input,
         "deterministic": {},
         "associative": [],
-        "identity": {"triggered": False, "score": 0.0}
+        "identity": {"triggered": False, "score": 0.0},
+        "tool_calls": []
     }
     
     # Phase 2: Deterministic Recall
@@ -53,8 +57,6 @@ def run_agent(user_input: str, session_id: str) -> str:
     for mem in raw_associative:
         sim = mem['similarity']
         trace["associative"].append({"content": mem['content'][:50], "sim": sim, "type": mem['type']})
-        
-        # Confidence Gating & Hedging
         if sim >= 0.85:
             associative_injections.append(f"[{mem['type']}]: {mem['content']}")
         elif sim >= 0.70:
@@ -73,25 +75,26 @@ def run_agent(user_input: str, session_id: str) -> str:
         trace["identity"]["hedged"] = True
 
     knowledge = memory_manager.get_knowledge()
-    LAST_TRACE = trace # Save for /debug trace
     
-    # 4. Build the prompt
-    prompt_sections = [SYSTEM_PROMPT]
+    # 4. Phase 4: Tool Schema Injection
+    tool_schemas = tool_manager.get_tool_schemas()
     
-    if knowledge:
-        prompt_sections.append(f"CORE KNOWLEDGE:\n{knowledge}")
+    # 5. Build the prompt
+    prompt_sections = [
+        SYSTEM_PROMPT,
+        f"\nAVAILABLE TOOLS:\n{tool_schemas}\n"
+        "TO CALL A TOOL, USE THIS JSON FORMAT AT THE END OF YOUR RESPONSE:\n"
+        "ACTION: {\"tool\": \"tool_name\", \"params\": {\"arg\": \"val\"}, \"reasoning\": \"why\"}\n"
+    ]
     
-    if identity_prompt:
-        prompt_sections.append(identity_prompt)
-        
+    if knowledge: prompt_sections.append(f"CORE KNOWLEDGE:\n{knowledge}")
+    if identity_prompt: prompt_sections.append(identity_prompt)
     if relevant_sections:
         relevant_text = "\n\n".join([f"RECALLED {k.upper()}:\n{v}" for k, v in relevant_sections.items()])
         prompt_sections.append(f"RELEVANT SESSION MEMORY:\n{relevant_text}")
-        
     if associative_injections:
         prompt_sections.append("[PHASE3] ASSOCIATIVE MEMORIES:\n" + "\n".join(associative_injections))
         
-    # 5. History & Finish Prompt
     history = memory_manager.get_history(session_id, limit=10)
     prompt_sections.append("CONVERSATION HISTORY:")
     for msg in history:
@@ -103,27 +106,64 @@ def run_agent(user_input: str, session_id: str) -> str:
     
     # 6. Get Response
     agent_response = run_openrouter(full_prompt)
-    memory_manager.add_message(session_id, "assistant", agent_response)
     
-    # 7. Periodic Maintenance
+    # 7. Phase 4: Parse & Execute Tool Calls
+    final_output = agent_response
+    if "ACTION:" in agent_response:
+        try:
+            parts = agent_response.split("ACTION:")
+            if len(parts) > 1:
+                action_json_str = parts[1].strip()
+                if "}" in action_json_str:
+                    action_json_str = action_json_str[:action_json_str.rfind("}")+1]
+                
+                try:
+                    action_data = json.loads(action_json_str)
+                    tool_name = action_data.get("tool")
+                    tool_params = action_data.get("params", {})
+                    reasoning = action_data.get("reasoning", "No reasoning provided.")
+                    
+                    trace["tool_calls"].append({"tool": tool_name, "params": tool_params, "reasoning": reasoning})
+                    
+                    # Safety Check
+                    requires_approval = tool_manager.tools.get(tool_name, {}).get("requires_approval", False)
+                    is_approved = any(word in user_input.lower() for word in ["proceed", "approve", "do it", "yes", "ok"])
+                    
+                    if requires_approval and not is_approved:
+                        final_output = (
+                            f"{parts[0].strip()}\n\n"
+                            f"⚠️ [SAFETY] I want to call '{tool_name}' for the following reason: {reasoning}.\n"
+                            f"Parameters: {tool_params}\n"
+                            f"Shall I proceed? Please say 'proceed' or 'approve'."
+                        )
+                    else:
+                        tool_result = tool_manager.invoke(tool_name, tool_params, session_id)
+                        result_str = json.dumps(tool_result)
+                        final_output = f"{parts[0].strip()}\n\n[SYSTEM] Tool '{tool_name}' executed. Result: {result_str}"
+                except json.JSONDecodeError as je:
+                    print(f"[PHASE4] JSON Parse Error: {je}")
+                    final_output = agent_response + f"\n\n[SYSTEM] Error parsing Action JSON: {je}"
+        except Exception as e:
+            print(f"[PHASE4] General Tool Error: {e}")
+            final_output = agent_response + f"\n\n[SYSTEM] Internal error during action processing: {e}"
+
+    LAST_TRACE = trace 
+    memory_manager.add_message(session_id, "assistant", final_output)
+    
+    # 8. Periodic Maintenance
     try:
         msg_count = memory_manager.get_message_count(session_id)
         if msg_count > 0 and msg_count % SUMMARY_THRESHOLD == 0:
             print(f"[MEMORY] Maintenance cycle triggered ({msg_count} msgs)")
             summarize_session(session_id)
-            
-            # Drift detection (Observational)
             memory_manager.detect_drift(session_id)
-            
-            # Identity maintenance
             summary_files = [f for f in os.listdir("memory/summaries") if f.endswith(".md")]
             if len(summary_files) > 0 and len(summary_files) % IDENTITY_UPDATE_INTERVAL == 0:
                 memory_manager.update_identity()
-                
     except Exception as e:
-        print(f"[MEMORY] Maintenance failure: {e}")
+        print(f"[MEMORY] Maintenance Error: {e}")
         
-    return agent_response
+    return final_output
 
 def summarize_session(session_id: str):
     """Asks the LLM to consolidate conversation into a structured Markdown summary."""

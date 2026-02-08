@@ -53,7 +53,8 @@ def chat():
 
             try:
                 start_time = time.time()
-                response = requests.post(url, json=payload, timeout=60)
+                # Increased timeout to 5 minutes to handle model loading/downloads
+                response = requests.post(url, json=payload, timeout=300)
                 elapsed_time = time.time() - start_time
                 response.raise_for_status()
                 

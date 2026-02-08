@@ -20,10 +20,8 @@ IDENTITY_FILE_PATH = "memory/identity.md"
 class MemoryManager:
     def __init__(self):
         self._init_db()
-        # Initialize local embedding model
-        print(f"[PHASE3] Loading local embedding model: {EMBEDDING_MODEL}...")
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
         self.dimension = EMBEDDING_DIMENSION
+        self.model = None # Lazy load on first use
         self._init_vector_db()
         
         if not os.path.exists(SUMMARIES_PATH):
@@ -94,10 +92,20 @@ class MemoryManager:
             print(f"[PHASE3] Failed to load index: {e}. Starting fresh.")
             self.index = faiss.IndexFlatL2(self.dimension)
 
+    def _get_model(self):
+        if self.model is None:
+            print(f"[PHASE3] Loading local embedding model: {EMBEDDING_MODEL} (this may take a minute)...")
+            # Save model to memory volume to avoid re-downloads
+            model_path = os.path.join("memory", "models")
+            if not os.path.exists(model_path): os.makedirs(model_path)
+            self.model = SentenceTransformer(EMBEDDING_MODEL, cache_folder=model_path)
+        return self.model
+
     def _get_embedding(self, text: str) -> List[float]:
         try:
             # Use local SentenceTransformer
-            embedding = self.model.encode(text).tolist()
+            model = self._get_model()
+            embedding = model.encode(text).tolist()
             return embedding
         except Exception as e:
             print(f"[PHASE3] Local embedding error: {e}")
