@@ -5,13 +5,13 @@ import numpy as np
 import math
 import faiss
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from sentence_transformers import SentenceTransformer
 from app.config import (
     OPENROUTER_API_KEY, VECTOR_DB_PATH, EMBEDDING_MODEL, EMBEDDING_DIMENSION,
     SIMILARITY_THRESHOLD, TOP_K_ASSOCIATIVE, IDENTITY_UPDATE_INTERVAL,
     DECAY_LAMBDA, REINFORCE_AMOUNT_ASSOCIATIVE, REINFORCE_AMOUNT_DETERMINISTIC,
-    MAX_SALIENCE, MIN_SALIENCE
+    MAX_SALIENCE, MIN_SALIENCE, COMPRESSION_THRESHOLD, COMPRESSION_SALIENCE_BOOST
 )
 
 DB_PATH = "memory/agent_memory.db"
@@ -334,7 +334,7 @@ class MemoryManager:
             cursor.execute(query, [session_id] + types)
             return [row[0] for row in cursor.fetchall()]
 
-    def get_associative_memory(self, user_input: str, skip_content: List[str] = None, return_raw: bool = False) -> any:
+    def get_associative_memory(self, user_input: str, skip_content: List[str] = None, return_raw: bool = False) -> Any:
         results = self.query_associative(user_input)
         if not results:
             print("[PHASE3] Associative search: No results above threshold.")
@@ -362,7 +362,7 @@ class MemoryManager:
             output.append(f"[{res['type']}] (Salience: {res['salience']}): {res['content']}")
         return "\n".join(output)
 
-    def get_identity(self, user_input: str, return_raw: bool = False) -> any:
+    def get_identity(self, user_input: str, return_raw: bool = False) -> Any:
         if not os.path.exists(IDENTITY_FILE_PATH): 
             return {"content": "", "similarity": 0.0} if return_raw else ""
         
@@ -562,6 +562,119 @@ class MemoryManager:
                 print(f"[PHASE5] Reinforced vector {vector_id} ({source}) (+{amount} -> {new_salience})")
         except Exception as e:
             print(f"[PHASE5] Reinforcement error: {e}")
+
+    def rebuild_index(self):
+        """Rebuilds the FAISS index from the ground up using SQLite metadata."""
+        print("[PHASE5.3] Rebuilding FAISS index from SQLite...")
+        new_index = faiss.IndexFlatL2(self.dimension)
+        
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT content, vector_id FROM vector_metadata ORDER BY vector_id ASC")
+            records = cursor.fetchall()
+            
+            if not records:
+                self.index = new_index
+                faiss.write_index(self.index, VECTOR_INDEX_PATH)
+                return
+
+            # Batch process embeddings for efficiency
+            texts = [r[0] for r in records]
+            model = self._get_model()
+            embeddings = model.encode(texts)
+            
+            vectors = np.array(embeddings).astype('float32')
+            faiss.normalize_L2(vectors)
+            new_index.add(vectors)
+            
+            # Update IDs in SQLite to match fresh sequential FAISS indices
+            # Since we ordered by old vector_id, the new index i matches record i
+            for i, r in enumerate(records):
+                old_id = r[1]
+                cursor.execute("UPDATE vector_metadata SET vector_id = ? WHERE vector_id = ?", (i, old_id))
+            
+            conn.commit()
+            
+        self.index = new_index
+        faiss.write_index(self.index, VECTOR_INDEX_PATH)
+        print(f"[PHASE5.3] Index rebuilt with {self.index.ntotal} vectors.")
+
+    def compress_and_merge_memory(self):
+        """Identifies and merges redundant or similar memories."""
+        print("[PHASE5.3] Starting memory compression...")
+        
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT vector_id, content, salience, type FROM vector_metadata WHERE salience < 0.95")
+            candidates = cursor.fetchall()
+            
+        if len(candidates) < 2:
+            print("[PHASE5.3] Not enough candidates for compression.")
+            return
+
+        processed_ids = set()
+        merged_count = 0
+        
+        from app.openrouter import run_openrouter
+
+        for vid, content, salience, mtype in candidates:
+            if vid in processed_ids: continue
+            
+            # Find neighbors using current index
+            # top_k=5 to find potential duplicates
+            results = self.query_associative(content, top_k=5)
+            # Filter for semantic similarity and exclude self
+            sim_neighbors = [r for r in results if r['vector_id'] != vid and r['similarity'] >= COMPRESSION_THRESHOLD and r['vector_id'] not in processed_ids]
+            
+            if not sim_neighbors: continue
+            
+            # We found a group to merge
+            group = [(vid, content, salience)] + [(n['vector_id'], n['content'], n['salience']) for n in sim_neighbors]
+            group_ids = [item[0] for item in group]
+            group_texts = [item[1] for item in group]
+            max_salience = max(item[2] for item in group)
+            
+            print(f"[PHASE5.3] Merging group: {group_ids}")
+            
+            # Merge logic using LLM
+            merge_prompt = f"""
+            The following memories are semantically redundant. 
+            Merge them into a single, concise, and high-density memory statement.
+            Preserve all unique facts, preferences, or technical details.
+            
+            MEMORIES TO MERGE:
+            {chr(10).join([f"- {t}" for t in group_texts])}
+            
+            Merged Memory (Single Paragraph):
+            """
+            merged_text = run_openrouter(merge_prompt).strip()
+            
+            if merged_text and "Error" not in merged_text:
+                # Update SQLite: Delete old, add new
+                with sqlite3.connect(METADATA_DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    placeholders = ', '.join(['?'] * len(group_ids))
+                    cursor.execute(f"DELETE FROM vector_metadata WHERE vector_id IN ({placeholders})", group_ids)
+                    
+                    # New salience: max + boost
+                    new_salience = min(max_salience + COMPRESSION_SALIENCE_BOOST, MAX_SALIENCE)
+                    
+                    # We add to SQLite only for now, then rebuild index to get fresh IDs
+                    # We use a temporary high ID to avoid collisions before rebuild
+                    temp_id = 999999 + merged_count
+                    cursor.execute(
+                        "INSERT INTO vector_metadata (vector_id, session_id, type, content, salience, timestamp, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (temp_id, "global_merge", "Merged Memory", merged_text, new_salience, datetime.now().isoformat(), datetime.now().isoformat())
+                    )
+                    conn.commit()
+                
+                processed_ids.update(group_ids)
+                merged_count += 1
+                print(f"[PHASE5.3] Created merged memory: {merged_text[:100]}...")
+
+        if merged_count > 0:
+            print(f"[PHASE5.3] Compression complete. Merged {merged_count} groups. Rebuilding index...")
+            self.rebuild_index()
 
 # Global instance
 memory_manager = MemoryManager()

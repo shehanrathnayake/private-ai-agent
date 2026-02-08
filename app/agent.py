@@ -204,6 +204,7 @@ def run_agent(user_input: str, session_id: str) -> str:
             summarize_session(session_id)
             memory_manager.detect_drift(session_id)
             memory_manager.decay_salience()
+            memory_manager.compress_and_merge_memory()
             
             # Identity formation triggers based on total summary volume (experience), not file count.
             update_count = memory_manager.get_summary_update_count()
