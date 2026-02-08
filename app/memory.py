@@ -5,9 +5,9 @@ import numpy as np
 import faiss
 from datetime import datetime
 from typing import List, Dict, Optional
-from openai import OpenAI
+from sentence_transformers import SentenceTransformer
 from app.config import (
-    OPENROUTER_API_KEY, VECTOR_DB_PATH, EMBEDDING_MODEL, 
+    OPENROUTER_API_KEY, VECTOR_DB_PATH, EMBEDDING_MODEL, EMBEDDING_DIMENSION,
     SIMILARITY_THRESHOLD, TOP_K_ASSOCIATIVE, IDENTITY_UPDATE_INTERVAL
 )
 
@@ -20,15 +20,14 @@ IDENTITY_FILE_PATH = "memory/identity.md"
 class MemoryManager:
     def __init__(self):
         self._init_db()
+        # Initialize local embedding model
+        print(f"[PHASE3] Loading local embedding model: {EMBEDDING_MODEL}...")
+        self.model = SentenceTransformer(EMBEDDING_MODEL)
+        self.dimension = EMBEDDING_DIMENSION
         self._init_vector_db()
+        
         if not os.path.exists(SUMMARIES_PATH):
             os.makedirs(SUMMARIES_PATH)
-        
-        # Initialize OpenAI client pointed to OpenRouter for embeddings
-        self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=OPENROUTER_API_KEY
-        )
 
     def _init_db(self):
         with sqlite3.connect(DB_PATH) as conn:
@@ -64,37 +63,44 @@ class MemoryManager:
             conn.commit()
             
         # Initialize FAISS index
-        self.dimension = 1536
         try:
             if os.path.exists(VECTOR_INDEX_PATH):
-                self.index = faiss.read_index(VECTOR_INDEX_PATH)
+                loaded_index = faiss.read_index(VECTOR_INDEX_PATH)
+                # Check if dimension matches (important if we switched models)
+                if loaded_index.d != self.dimension:
+                    print(f"[PHASE3] Dimension mismatch (Index: {loaded_index.d}, Model: {self.dimension}). Resetting index.")
+                    self.index = faiss.IndexFlatL2(self.dimension)
+                    # Also clear metadata DB if we reset the index
+                    with sqlite3.connect(METADATA_DB_PATH) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM vector_metadata")
+                        conn.commit()
+                else:
+                    self.index = loaded_index
+                
                 # Verify sync between SQLite and FAISS
                 with sqlite3.connect(METADATA_DB_PATH) as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT COUNT(*) FROM vector_metadata")
                     db_count = cursor.fetchone()[0]
                     if db_count != self.index.ntotal:
-                        print(f"[PHASE3] WARNING: Vector mismatch (DB: {db_count}, FAISS: {self.index.ntotal}). Re-initializing index.")
+                        print(f"[PHASE3] WARNING: Vector count mismatch (DB: {db_count}, FAISS: {self.index.ntotal}). Re-initializing.")
                         self.index = faiss.IndexFlatL2(self.dimension)
                         cursor.execute("DELETE FROM vector_metadata")
                         conn.commit()
             else:
                 self.index = faiss.IndexFlatL2(self.dimension)
         except Exception as e:
-            print(f"[PHASE3] Failed to load index: {e}")
+            print(f"[PHASE3] Failed to load index: {e}. Starting fresh.")
             self.index = faiss.IndexFlatL2(self.dimension)
 
     def _get_embedding(self, text: str) -> List[float]:
         try:
-            # Simple sanitization
-            text = text.replace("\n", " ")
-            response = self.client.embeddings.create(
-                input=text,
-                model=EMBEDDING_MODEL
-            )
-            return response.data[0].embedding
+            # Use local SentenceTransformer
+            embedding = self.model.encode(text).tolist()
+            return embedding
         except Exception as e:
-            print(f"[PHASE3] Embedding error: {e}")
+            print(f"[PHASE3] Local embedding error: {e}")
             return [0.0] * self.dimension
 
     def add_vector(self, text: str, session_id: str, mem_type: str, salience: float = 0.5):
