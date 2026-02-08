@@ -114,6 +114,18 @@ class MemoryManager:
     def add_vector(self, text: str, session_id: str, mem_type: str, salience: float = 0.5):
         if not text.strip(): return
         
+        # Lightweight Deduplication: Check last 5 vectors of same type
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT content FROM vector_metadata WHERE type = ? ORDER BY vector_id DESC LIMIT 5",
+                (mem_type,)
+            )
+            recent_contents = [row[0] for row in cursor.fetchall()]
+            if text in recent_contents:
+                # print(f"[MEMORY] Skipping duplicate vector insertion for type: {mem_type}")
+                return
+
         embedding = self._get_embedding(text)
         if all(v == 0.0 for v in embedding):
             return

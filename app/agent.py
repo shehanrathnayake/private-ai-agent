@@ -83,8 +83,11 @@ def run_agent(user_input: str, session_id: str) -> str:
     prompt_sections = [
         SYSTEM_PROMPT,
         f"\nAVAILABLE TOOLS:\n{tool_schemas}\n"
-        "TO CALL A TOOL, USE THIS JSON FORMAT AT THE END OF YOUR RESPONSE:\n"
-        "ACTION: {\"tool\": \"tool_name\", \"params\": {\"arg\": \"val\"}, \"reasoning\": \"why\"}\n"
+        "TO CALL A TOOL, YOU MUST USE THE DELIMITER ---ACTION--- AT THE VERY END OF YOUR RESPONSE.\n"
+        "ANYTHING AFTER THIS DELIMITER MUST BE VALID JSON.\n"
+        "FORMAT:\n"
+        "---ACTION---\n"
+        "{\"tool\": \"tool_name\", \"params\": {\"arg\": \"val\"}, \"reasoning\": \"why\"}\n"
     ]
     
     if knowledge: prompt_sections.append(f"CORE KNOWLEDGE:\n{knowledge}")
@@ -109,43 +112,63 @@ def run_agent(user_input: str, session_id: str) -> str:
     
     # 7. Phase 4: Parse & Execute Tool Calls
     final_output = agent_response
-    if "ACTION:" in agent_response:
+    if "---ACTION---" in agent_response:
         try:
-            parts = agent_response.split("ACTION:")
+            # Use rsplit to honor only the FINAL delimiter
+            parts = agent_response.rsplit("---ACTION---", 1)
             if len(parts) > 1:
+                prefix_text = parts[0].strip()
                 action_json_str = parts[1].strip()
-                if "}" in action_json_str:
-                    action_json_str = action_json_str[:action_json_str.rfind("}")+1]
                 
+                # Clean up markdown blocks
+                if "```json" in action_json_str:
+                    action_json_str = action_json_str.split("```json")[1].split("```")[0].strip()
+                elif "```" in action_json_str:
+                    action_json_str = action_json_str.split("```")[1].split("```")[0].strip()
+
                 try:
                     action_data = json.loads(action_json_str)
                     tool_name = action_data.get("tool")
                     tool_params = action_data.get("params", {})
                     reasoning = action_data.get("reasoning", "No reasoning provided.")
                     
-                    trace["tool_calls"].append({"tool": tool_name, "params": tool_params, "reasoning": reasoning})
-                    
-                    # Safety Check
-                    requires_approval = tool_manager.tools.get(tool_name, {}).get("requires_approval", False)
-                    is_approved = any(word in user_input.lower() for word in ["proceed", "approve", "do it", "yes", "ok"])
-                    
-                    if requires_approval and not is_approved:
-                        final_output = (
-                            f"{parts[0].strip()}\n\n"
-                            f"⚠️ [SAFETY] I want to call '{tool_name}' for the following reason: {reasoning}.\n"
-                            f"Parameters: {tool_params}\n"
-                            f"Shall I proceed? Please say 'proceed' or 'approve'."
-                        )
+                    # 1. Unknown Tool Check (Fail Fast)
+                    if tool_name not in tool_manager.tools:
+                        final_output = f"{prefix_text}\n\n[SYSTEM] Unknown tool '{tool_name}'. Action aborted."
                     else:
-                        tool_result = tool_manager.invoke(tool_name, tool_params, session_id)
-                        result_str = json.dumps(tool_result)
-                        final_output = f"{parts[0].strip()}\n\n[SYSTEM] Tool '{tool_name}' executed. Result: {result_str}"
+                        trace["tool_calls"].append({"tool": tool_name, "params": tool_params, "reasoning": reasoning})
+                        
+                        # 2. Safety & Approval Check
+                        tool_info = tool_manager.tools[tool_name]
+                        requires_approval = tool_info.get("requires_approval", False)
+                        
+                        # Exact match approval
+                        is_approved = user_input.strip() in ["/approve", "/proceed"]
+                        
+                        if requires_approval and not is_approved:
+                            final_output = (
+                                f"{prefix_text}\n\n"
+                                f"⚠️ [SAFETY] I want to call '{tool_name}' for the following reason: {reasoning}.\n"
+                                f"Parameters: {tool_params}\n"
+                                f"Shall I proceed? Please type '/approve' or '/proceed' to confirm."
+                            )
+                        else:
+                            # 3. Execution
+                            tool_result = tool_manager.invoke(tool_name, tool_params, session_id)
+                            result_str = json.dumps(tool_result)
+                            final_output = f"{prefix_text}\n\n[SYSTEM] Tool '{tool_name}' executed. Result: {result_str}"
+                            
+                            # 4. Success Persistence (Add to Associative Memory)
+                            if tool_result.get("status") == "success":
+                                action_summary = f"Tool executed: {tool_name} -> {result_str[:100]}"
+                                memory_manager.add_vector(action_summary, session_id, "Open Threads", salience=0.8)
+                                
                 except json.JSONDecodeError as je:
-                    print(f"[PHASE4] JSON Parse Error: {je}")
-                    final_output = agent_response + f"\n\n[SYSTEM] Error parsing Action JSON: {je}"
+                    # abort action safely
+                    final_output = agent_response + f"\n\n[SYSTEM] Action aborted: Malformed JSON after delimiter."
         except Exception as e:
             print(f"[PHASE4] General Tool Error: {e}")
-            final_output = agent_response + f"\n\n[SYSTEM] Internal error during action processing: {e}"
+            final_output = agent_response + f"\n\n[SYSTEM] Internal error during action processing."
 
     LAST_TRACE = trace 
     memory_manager.add_message(session_id, "assistant", final_output)
