@@ -11,7 +11,8 @@ from app.config import (
     OPENROUTER_API_KEY, VECTOR_DB_PATH, EMBEDDING_MODEL, EMBEDDING_DIMENSION,
     SIMILARITY_THRESHOLD, TOP_K_ASSOCIATIVE, IDENTITY_UPDATE_INTERVAL,
     DECAY_LAMBDA, REINFORCE_AMOUNT_ASSOCIATIVE, REINFORCE_AMOUNT_DETERMINISTIC,
-    MAX_SALIENCE, MIN_SALIENCE, COMPRESSION_THRESHOLD, COMPRESSION_SALIENCE_BOOST
+    MAX_SALIENCE, MIN_SALIENCE, COMPRESSION_THRESHOLD, COMPRESSION_SALIENCE_BOOST,
+    MAX_MERGES_PER_CYCLE, MIN_INDEX_SIZE_FOR_COMPRESSION
 )
 
 DB_PATH = "memory/agent_memory.db"
@@ -59,7 +60,10 @@ class MemoryManager:
                     content TEXT,
                     salience REAL,
                     timestamp TEXT,
-                    last_accessed_at TEXT
+                    last_accessed_at TEXT,
+                    merged INTEGER DEFAULT 0,
+                    source_vector_ids TEXT,
+                    scope TEXT DEFAULT 'session'
                 )
             """)
             # Migration check
@@ -67,6 +71,12 @@ class MemoryManager:
             columns = [col[1] for col in cursor.fetchall()]
             if 'last_accessed_at' not in columns:
                 cursor.execute("ALTER TABLE vector_metadata ADD COLUMN last_accessed_at TEXT")
+            if 'merged' not in columns:
+                cursor.execute("ALTER TABLE vector_metadata ADD COLUMN merged INTEGER DEFAULT 0")
+            if 'source_vector_ids' not in columns:
+                cursor.execute("ALTER TABLE vector_metadata ADD COLUMN source_vector_ids TEXT")
+            if 'scope' not in columns:
+                cursor.execute("ALTER TABLE vector_metadata ADD COLUMN scope TEXT DEFAULT 'session'")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS system_metadata (
                     key TEXT PRIMARY KEY,
@@ -79,33 +89,32 @@ class MemoryManager:
         try:
             if os.path.exists(VECTOR_INDEX_PATH):
                 loaded_index = faiss.read_index(VECTOR_INDEX_PATH)
-                # Check if dimension matches (important if we switched models)
+                # Check if dimension matches
                 if loaded_index.d != self.dimension:
-                    print(f"[PHASE3] Dimension mismatch (Index: {loaded_index.d}, Model: {self.dimension}). Resetting index.")
-                    self.index = faiss.IndexFlatL2(self.dimension)
-                    # Also clear metadata DB if we reset the index
+                    print(f"[PHASE3] Dimension mismatch. Resetting index.")
+                    self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
                     with sqlite3.connect(METADATA_DB_PATH) as conn:
                         cursor = conn.cursor()
                         cursor.execute("DELETE FROM vector_metadata")
                         conn.commit()
                 else:
-                    self.index = loaded_index
-                
-                # Verify sync between SQLite and FAISS
-                with sqlite3.connect(METADATA_DB_PATH) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT COUNT(*) FROM vector_metadata")
-                    db_count = cursor.fetchone()[0]
-                    if db_count != self.index.ntotal:
-                        print(f"[PHASE3] WARNING: Vector count mismatch (DB: {db_count}, FAISS: {self.index.ntotal}). Re-initializing.")
-                        self.index = faiss.IndexFlatL2(self.dimension)
-                        cursor.execute("DELETE FROM vector_metadata")
-                        conn.commit()
+                    if not isinstance(loaded_index, faiss.IndexIDMap):
+                        print("[PHASE3] Converting IndexFlat to IndexIDMap for immutable ID support.")
+                        # Create a new IndexIDMap and add existing vectors with their current sequential IDs
+                        # This bridges the gap for existing contiguous indices.
+                        self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
+                        if loaded_index.ntotal > 0:
+                            # Re-add all vectors from the loaded flat index
+                            vectors = faiss.rev_swig_ptr(loaded_index.get_xb(), loaded_index.ntotal * loaded_index.d).reshape(loaded_index.ntotal, loaded_index.d)
+                            ids = np.arange(loaded_index.ntotal).astype('int64')
+                            self.index.add_with_ids(vectors, ids)
+                    else:
+                        self.index = loaded_index
             else:
-                self.index = faiss.IndexFlatL2(self.dimension)
+                self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
         except Exception as e:
             print(f"[PHASE3] Failed to load index: {e}. Starting fresh.")
-            self.index = faiss.IndexFlatL2(self.dimension)
+            self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
 
     def _get_system_metadata(self, key: str, default: str = None) -> str:
         with sqlite3.connect(METADATA_DB_PATH) as conn:
@@ -162,17 +171,19 @@ class MemoryManager:
             vector = np.array([embedding]).astype('float32')
             faiss.normalize_L2(vector)
             
-            vector_id = self.index.ntotal
-            self.index.add(vector)
-            faiss.write_index(self.index, VECTOR_INDEX_PATH)
-            
             with sqlite3.connect(METADATA_DB_PATH) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "INSERT INTO vector_metadata (vector_id, session_id, type, content, salience, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                    (vector_id, session_id, mem_type, text, salience, datetime.now().isoformat())
+                    "INSERT INTO vector_metadata (session_id, type, content, salience, timestamp, scope) VALUES (?, ?, ?, ?, ?, ?)",
+                    (session_id, mem_type, text, salience, datetime.now().isoformat(), 'session')
                 )
+                vector_id = cursor.lastrowid
                 conn.commit()
+
+            # Now add to FAISS with the permanent SQLite ID
+            self.index.add_with_ids(vector, np.array([vector_id], dtype='int64'))
+            faiss.write_index(self.index, VECTOR_INDEX_PATH)
+            
             print(f"[PHASE3] Vector {vector_id} added: Type={mem_type}, Salience={salience}")
         except Exception as e:
             print(f"[PHASE3] Error adding vector: {e}")
@@ -198,9 +209,14 @@ class MemoryManager:
                     # normalized L2 distance to similarity
                     similarity = 1 - (distances[0][i] / 2)
                     if similarity >= SIMILARITY_THRESHOLD:
-                        cursor.execute("SELECT type, content, salience FROM vector_metadata WHERE vector_id = ?", (int(idx),))
+                        # Fix 4: Filter out merged=1 to prevent recall before/during rebuild
+                        cursor.execute("SELECT type, content, salience FROM vector_metadata WHERE vector_id = ? AND merged = 0", (int(idx),))
                         row = cursor.fetchone()
                         if row:
+                            # Fix 3: Update last_accessed_at for retrieved vectors
+                            now_str = datetime.now().isoformat()
+                            cursor.execute("UPDATE vector_metadata SET last_accessed_at = ? WHERE vector_id = ?", (now_str, int(idx)))
+                            
                             results.append({
                                 "vector_id": int(idx),
                                 "type": row[0],
@@ -208,6 +224,7 @@ class MemoryManager:
                                 "salience": row[2],
                                 "similarity": float(similarity)
                             })
+                conn.commit()
             
             # Sort by salience then similarity
             results.sort(key=lambda x: (x['salience'], x['similarity']), reverse=True)
@@ -321,17 +338,26 @@ class MemoryManager:
             results["Open Threads"] = sections["Open Threads"]
             recalled_types.append("Open Threads")
             
-        vector_ids = self.get_vector_ids_for_session(session_id, recalled_types)
+        # Fix 3: Deterministic recall only uses scope='session'
+        vector_ids = self.get_vector_ids_for_session(session_id, recalled_types, scope='session')
         return {"sections": results, "vector_ids": vector_ids}
 
-    def get_vector_ids_for_session(self, session_id: str, types: List[str]) -> List[int]:
+    def get_vector_ids_for_session(self, session_id: str, types: List[str], scope: str = None) -> List[int]:
         """Returns all vector IDs for the given types in a specific session."""
         if not types: return []
         with sqlite3.connect(METADATA_DB_PATH) as conn:
             cursor = conn.cursor()
             placeholders = ', '.join(['?'] * len(types))
-            query = f"SELECT vector_id FROM vector_metadata WHERE session_id = ? AND type IN ({placeholders})"
-            cursor.execute(query, [session_id] + types)
+            
+            clause = "session_id = ? AND type IN ({})"
+            params = [session_id] + types
+            
+            if scope:
+                clause += " AND scope = ?"
+                params.append(scope)
+                
+            query = f"SELECT vector_id FROM vector_metadata WHERE {clause.format(placeholders)}"
+            cursor.execute(query, params)
             return [row[0] for row in cursor.fetchall()]
 
     def get_associative_memory(self, user_input: str, skip_content: List[str] = None, return_raw: bool = False) -> Any:
@@ -564,13 +590,15 @@ class MemoryManager:
             print(f"[PHASE5] Reinforcement error: {e}")
 
     def rebuild_index(self):
-        """Rebuilds the FAISS index from the ground up using SQLite metadata."""
-        print("[PHASE5.3] Rebuilding FAISS index from SQLite...")
-        new_index = faiss.IndexFlatL2(self.dimension)
+        """Rebuilds the FAISS index while preserving immutable vector_ids."""
+        print("[PHASE5.3] Rebuilding FAISS index (preserving permanent IDs)...")
+        # Use a fresh IndexIDMap to allow gaps in IDs
+        new_index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
         
         with sqlite3.connect(METADATA_DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT content, vector_id FROM vector_metadata ORDER BY vector_id ASC")
+            # Fix 1: Order by ID but do NOT reassign them
+            cursor.execute("SELECT content, vector_id FROM vector_metadata WHERE merged = 0 ORDER BY vector_id ASC")
             records = cursor.fetchall()
             
             if not records:
@@ -578,103 +606,159 @@ class MemoryManager:
                 faiss.write_index(self.index, VECTOR_INDEX_PATH)
                 return
 
-            # Batch process embeddings for efficiency
+            # Batch process embeddings
             texts = [r[0] for r in records]
             model = self._get_model()
             embeddings = model.encode(texts)
             
             vectors = np.array(embeddings).astype('float32')
             faiss.normalize_L2(vectors)
-            new_index.add(vectors)
             
-            # Update IDs in SQLite to match fresh sequential FAISS indices
-            # Since we ordered by old vector_id, the new index i matches record i
-            for i, r in enumerate(records):
-                old_id = r[1]
-                cursor.execute("UPDATE vector_metadata SET vector_id = ? WHERE vector_id = ?", (i, old_id))
+            # Use original IDs from SQLite
+            ids = np.array([r[1] for r in records]).astype('int64')
+            new_index.add_with_ids(vectors, ids)
             
+            # Delete old merged rows
+            cursor.execute("DELETE FROM vector_metadata WHERE merged = 1")
             conn.commit()
             
         self.index = new_index
         faiss.write_index(self.index, VECTOR_INDEX_PATH)
-        print(f"[PHASE5.3] Index rebuilt with {self.index.ntotal} vectors.")
+        print(f"[PHASE5.3] Index rebuilt with {self.index.ntotal} vectors. All IDs preserved.")
 
     def compress_and_merge_memory(self):
-        """Identifies and merges redundant or similar memories."""
-        print("[PHASE5.3] Starting memory compression...")
-        
-        with sqlite3.connect(METADATA_DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT vector_id, content, salience, type FROM vector_metadata WHERE salience < 0.95")
-            candidates = cursor.fetchall()
-            
-        if len(candidates) < 2:
-            print("[PHASE5.3] Not enough candidates for compression.")
+        """Identifies and merges redundant or similar memories with structural hardening."""
+        # Fix 1: Compression Re-entrancy Guard
+        if self._get_system_metadata("compression_in_progress") == "1":
+            print("[PHASE5.3] Guard: Compression already in progress. Aborting.")
             return
 
-        processed_ids = set()
-        merged_count = 0
-        
-        from app.openrouter import run_openrouter
+        try:
+            self._set_system_metadata("compression_in_progress", "1")
+            print("[PHASE5.3] Acquired compression lock.")
 
-        for vid, content, salience, mtype in candidates:
-            if vid in processed_ids: continue
+            # Guard: Abort compression if index size < threshold
+            if self.index.ntotal < MIN_INDEX_SIZE_FOR_COMPRESSION:
+                print(f"[PHASE5.3] Index size ({self.index.ntotal}) below threshold ({MIN_INDEX_SIZE_FOR_COMPRESSION}).")
+                return
+
+            print("[PHASE5.3] Starting hardened memory compression cycle...")
             
-            # Find neighbors using current index
-            # top_k=5 to find potential duplicates
-            results = self.query_associative(content, top_k=5)
-            # Filter for semantic similarity and exclude self
-            sim_neighbors = [r for r in results if r['vector_id'] != vid and r['similarity'] >= COMPRESSION_THRESHOLD and r['vector_id'] not in processed_ids]
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT vector_id, content, salience, type FROM vector_metadata 
+                    WHERE salience >= 0.3 AND salience < 0.95 
+                    AND merged = 0 
+                    AND scope = 'session'
+                    AND type != 'Merged Memory'
+                    AND type != 'Identity'
+                    AND NOT (type = 'Open Threads' AND salience >= 0.8)
+                """)
+                candidates = cursor.fetchall()
+                
+            if len(candidates) < 2:
+                print("[PHASE5.3] Insufficient candidates for compression.")
+                return
+
+            processed_ids = set()
+            merged_count = 0
+            new_merged_ids = []
             
-            if not sim_neighbors: continue
-            
-            # We found a group to merge
-            group = [(vid, content, salience)] + [(n['vector_id'], n['content'], n['salience']) for n in sim_neighbors]
-            group_ids = [item[0] for item in group]
-            group_texts = [item[1] for item in group]
-            max_salience = max(item[2] for item in group)
-            
-            print(f"[PHASE5.3] Merging group: {group_ids}")
-            
-            # Merge logic using LLM
-            merge_prompt = f"""
-            The following memories are semantically redundant. 
-            Merge them into a single, concise, and high-density memory statement.
-            Preserve all unique facts, preferences, or technical details.
-            
-            MEMORIES TO MERGE:
-            {chr(10).join([f"- {t}" for t in group_texts])}
-            
-            Merged Memory (Single Paragraph):
-            """
-            merged_text = run_openrouter(merge_prompt).strip()
-            
-            if merged_text and "Error" not in merged_text:
-                # Update SQLite: Delete old, add new
+            from app.openrouter import run_openrouter
+
+            for vid, content, salience, mtype in candidates:
+                if vid in processed_ids: continue
+                if merged_count >= MAX_MERGES_PER_CYCLE: break
+                
+                results = self.query_associative(content, top_k=5)
+                
+                sim_neighbors = []
+                for r in results:
+                    n_vid = r['vector_id']
+                    if n_vid == vid or n_vid in processed_ids: continue
+                    if r['similarity'] < COMPRESSION_THRESHOLD: continue
+                    if r['type'] != mtype: continue 
+                    
+                    with sqlite3.connect(METADATA_DB_PATH) as conn:
+                        c2 = conn.cursor()
+                        c2.execute("SELECT salience FROM vector_metadata WHERE vector_id = ? AND merged = 0 AND scope = 'session'", (n_vid,))
+                        n_row = c2.fetchone()
+                        if not n_row: continue
+                        n_sal = n_row[0]
+                        if mtype == 'Open Threads' and n_sal >= 0.8: continue
+                        if n_sal < 0.3: continue 
+                        
+                    sim_neighbors.append(r)
+                
+                if len(sim_neighbors) < 1: continue 
+                
+                group = [(vid, content, salience)] + [(n['vector_id'], n['content'], n['salience']) for n in sim_neighbors]
+                group_ids = [item[0] for item in group]
+                group_texts = [item[1] for item in group]
+                max_salience = max(item[2] for item in group)
+                
+                print(f"[PHASE5.3][MERGE] type={mtype} ids={group_ids} start_salience={salience}")
+                
+                merge_prompt = f"""
+                The following memories are semantically redundant. 
+                Merge them into a single, concise, and high-density memory statement.
+                Preserve all unique facts, preferences, or technical details.
+                
+                MEMORIES TO MERGE:
+                {chr(10).join([f"- {t}" for t in group_texts])}
+                
+                Merged Memory (Single Paragraph):
+                """
+                merged_text = run_openrouter(merge_prompt).strip()
+                
+                if merged_text and "Error" not in merged_text:
+                    with sqlite3.connect(METADATA_DB_PATH) as conn:
+                        cursor = conn.cursor()
+                        placeholders = ', '.join(['?'] * len(group_ids))
+                        cursor.execute(f"UPDATE vector_metadata SET merged = 1 WHERE vector_id IN ({placeholders})", group_ids)
+                        
+                        new_salience = min(max_salience + COMPRESSION_SALIENCE_BOOST, MAX_SALIENCE)
+                        now_str = datetime.now().isoformat()
+                        
+                        # Fix 2 (Option A): Insert with merged = 1 until rebuild is complete
+                        cursor.execute(
+                            "INSERT INTO vector_metadata (session_id, type, content, salience, timestamp, last_accessed_at, merged, source_vector_ids, scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            ("global_merge", "Merged Memory", merged_text, new_salience, now_str, now_str, 1, json.dumps(group_ids), 'global')
+                        )
+                        new_id = cursor.lastrowid
+                        new_merged_ids.append((new_id, merged_text))
+                        conn.commit()
+                    
+                    processed_ids.update(group_ids)
+                    merged_count += 1
+                    print(f"[PHASE5.3][MERGE] SUCCESS -> new_id={new_id} preview='{merged_text[:60]}...'")
+
+            if merged_count > 0:
+                print(f"[PHASE5.3] Groups merged. Rebuilding index to purge old vectors...")
+                self.rebuild_index()
+                
+                # Fix 2: Flip merged = 0 and add to FAISS after rebuild is complete
                 with sqlite3.connect(METADATA_DB_PATH) as conn:
                     cursor = conn.cursor()
-                    placeholders = ', '.join(['?'] * len(group_ids))
-                    cursor.execute(f"DELETE FROM vector_metadata WHERE vector_id IN ({placeholders})", group_ids)
-                    
-                    # New salience: max + boost
-                    new_salience = min(max_salience + COMPRESSION_SALIENCE_BOOST, MAX_SALIENCE)
-                    
-                    # We add to SQLite only for now, then rebuild index to get fresh IDs
-                    # We use a temporary high ID to avoid collisions before rebuild
-                    temp_id = 999999 + merged_count
-                    cursor.execute(
-                        "INSERT INTO vector_metadata (vector_id, session_id, type, content, salience, timestamp, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (temp_id, "global_merge", "Merged Memory", merged_text, new_salience, datetime.now().isoformat(), datetime.now().isoformat())
-                    )
+                    for new_id, text in new_merged_ids:
+                        cursor.execute("UPDATE vector_metadata SET merged = 0 WHERE vector_id = ?", (new_id,))
+                        # Embed and add to FAISS manually
+                        emb = self._get_embedding(text)
+                        vec = np.array([emb]).astype('float32')
+                        faiss.normalize_L2(vec)
+                        self.index.add_with_ids(vec, np.array([new_id], dtype='int64'))
                     conn.commit()
-                
-                processed_ids.update(group_ids)
-                merged_count += 1
-                print(f"[PHASE5.3] Created merged memory: {merged_text[:100]}...")
+                faiss.write_index(self.index, VECTOR_INDEX_PATH)
+                print(f"[PHASE5.3] Multi-merge complete. {merged_count} new memories active.")
+            else:
+                print("[PHASE5.3] Cycle finished with no merges.")
 
-        if merged_count > 0:
-            print(f"[PHASE5.3] Compression complete. Merged {merged_count} groups. Rebuilding index...")
-            self.rebuild_index()
+        except Exception as e:
+            print(f"[PHASE5.3] Compression error: {e}")
+        finally:
+            self._set_system_metadata("compression_in_progress", "0")
+            print("[PHASE5.3] Released compression lock.")
 
 # Global instance
 memory_manager = MemoryManager()
