@@ -960,5 +960,71 @@ class MemoryManager:
             print(f"[PHASE6] Predictive recall error: {e}")
             return []
 
+    def summarize_cross_session_context(self, user_input: str, top_k: int = 5) -> str:
+        """Combines relevant associative memories + predictive recall memories into a human-readable summary (Phase 6)."""
+        print(f"[PHASE6] Generating cross-session context summary for: '{user_input[:50]}...'")
+        
+        # 1. Gather memories
+        associative = self.get_aging_aware_associative(user_input, top_k=10)
+        predicted = self.predictive_recall(user_input, top_k=top_k)
+        
+        # 2. Combine and Deduplicate (by content)
+        combined = []
+        seen_content = set()
+        
+        # Process associative first (primary relevance)
+        for mem in associative:
+            content_hash = mem['content'].strip().lower()
+            if content_hash not in seen_content:
+                combined.append(mem)
+                seen_content.add(content_hash)
+        
+        # Process predicted (secondary relevance)
+        for mem in predicted:
+            content_hash = mem['content'].strip().lower()
+            if content_hash not in seen_content:
+                combined.append(mem)
+                seen_content.add(content_hash)
+        
+        if not combined:
+            return ""
+
+        # 3. Group by type
+        grouped = {}
+        for mem in combined:
+            mtype = mem['type']
+            if mtype not in grouped:
+                grouped[mtype] = []
+            grouped[mtype].append(mem)
+        
+        # 4. Filter and Sort
+        summary_sections = []
+        all_sorted_by_salience = sorted(combined, key=lambda x: x['salience'], reverse=True)
+        
+        print(f"[PHASE6][SUMMARY] Group distribution:")
+        for mtype, items in grouped.items():
+            # Sort by salience within type
+            items.sort(key=lambda x: x['salience'], reverse=True)
+            # Take top_k
+            selected = items[:top_k]
+            print(f"  - {mtype}: {len(selected)} memories")
+            
+            type_text = f"--- {mtype.upper()} ---"
+            for s_mem in selected:
+                type_text += f"\n- {s_mem['content']}"
+            summary_sections.append(type_text)
+
+        # 5. Logging highlights (Top 3 salience)
+        print(f"[PHASE6][SUMMARY] Salience Highlights:")
+        for highlight in all_sorted_by_salience[:3]:
+            print(f"  * [{highlight['type']}] (Sal: {highlight['salience']:.2f}): {highlight['content'][:60]}...")
+
+        # 6. Final assembly
+        final_summary = "### CROSS-SESSION CONTEXT SUMMARY ###\n\n"
+        final_summary += "\n\n".join(summary_sections)
+        final_summary += "\n\n#####################################"
+        
+        return final_summary
+
 # Global instance
 memory_manager = MemoryManager()

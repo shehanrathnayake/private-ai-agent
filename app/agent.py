@@ -55,45 +55,22 @@ def run_agent(user_input: str, session_id: str) -> str:
     deterministic_vector_ids = relevant_res["vector_ids"]
     trace["deterministic"] = {k: True for k in relevant_sections.keys()}
     
-    # Phase 3: Associative Recall (Aging-Aware, Phase 5.4)
+    # Phase 3 & 6: Unified Cross-Session Context (Aging-Aware & Predictive)
     skip_content = list(relevant_sections.values())
-    raw_associative = memory_manager.get_aging_aware_associative(user_input, skip_content=skip_content)
+    cross_session_summary = memory_manager.summarize_cross_session_context(user_input, top_k=5)
+    trace["cross_session_summary"] = cross_session_summary
     
-    associative_injections = []
+    # Still need individual IDs for reinforcement logic and tracing
+    raw_associative = memory_manager.get_aging_aware_associative(user_input, skip_content=skip_content)
     used_associative_vector_ids = []
     for mem in raw_associative:
-        score = mem['effective_score']
+        used_associative_vector_ids.append(mem['vector_id'])
         trace["associative"].append({
             "content": mem['content'][:50], 
-            "score": score, 
+            "score": mem['effective_score'], 
             "type": mem['type']
         })
-        
-        # Injection logic: Stronger phrasing for higher effective scores
-        if score >= 0.85:
-            associative_injections.append(f"[{mem['type']}]: {mem['content']}")
-        else:
-            associative_injections.append(f"[{mem['type']} (Recall)]: I recall something relevant - {mem['content']}")
-            
-        used_associative_vector_ids.append(mem['vector_id'])
-            
-    # Phase 6: Predictive Recall (Cross-Session Linkage)
-    raw_predicted = memory_manager.predictive_recall(user_input, top_k=5)
-    predicted_injections = []
-    for pred in raw_predicted:
-        # Deduplicate against deterministic and associative already in skip_content
-        if pred['content'] in skip_content:
-            continue
-        # Also check if it's already in associative_injections content (partial match)
-        if any(pred['content'] in s for s in associative_injections):
-            continue
-            
-        predicted_injections.append(f"[Follow-up Context]: {pred['content']}")
-        trace["predicted"].append({
-            "content": pred['content'][:50],
-            "type": pred['type']
-        })
-        # Note: We don't reinforce predictions here, only if they are actually used in a future turn.
+
     # Phase 3: Identity-Aware Recall
     id_res = memory_manager.get_identity(user_input, return_raw=True)
     trace["identity"] = {"score": id_res['similarity']}
@@ -132,11 +109,10 @@ def run_agent(user_input: str, session_id: str) -> str:
     if relevant_sections:
         relevant_text = "\n\n".join([f"RECALLED {k.upper()}:\n{v}" for k, v in relevant_sections.items()])
         prompt_sections.append(f"RELEVANT SESSION MEMORY:\n{relevant_text}")
-    if associative_injections:
-        prompt_sections.append("[PHASE3] ASSOCIATIVE MEMORIES:\n" + "\n".join(associative_injections))
+    
+    if cross_session_summary:
+        prompt_sections.append(cross_session_summary)
         
-    if predicted_injections:
-        prompt_sections.append("[PHASE6] PREDICTED FOLLOW-UP CONTEXT:\n" + "\n".join(predicted_injections))
     history = memory_manager.get_history(session_id, limit=10)
     prompt_sections.append("CONVERSATION HISTORY:")
     for msg in history:
