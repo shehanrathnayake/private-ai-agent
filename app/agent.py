@@ -43,6 +43,7 @@ def run_agent(user_input: str, session_id: str) -> str:
         "input": user_input,
         "deterministic": {},
         "associative": [],
+        "predicted": [],
         "identity": {"triggered": False, "score": 0.0},
         "tool_calls": []
     }
@@ -76,6 +77,23 @@ def run_agent(user_input: str, session_id: str) -> str:
             
         used_associative_vector_ids.append(mem['vector_id'])
             
+    # Phase 6: Predictive Recall (Cross-Session Linkage)
+    raw_predicted = memory_manager.predictive_recall(user_input, top_k=5)
+    predicted_injections = []
+    for pred in raw_predicted:
+        # Deduplicate against deterministic and associative already in skip_content
+        if pred['content'] in skip_content:
+            continue
+        # Also check if it's already in associative_injections content (partial match)
+        if any(pred['content'] in s for s in associative_injections):
+            continue
+            
+        predicted_injections.append(f"[Follow-up Context]: {pred['content']}")
+        trace["predicted"].append({
+            "content": pred['content'][:50],
+            "type": pred['type']
+        })
+        # Note: We don't reinforce predictions here, only if they are actually used in a future turn.
     # Phase 3: Identity-Aware Recall
     id_res = memory_manager.get_identity(user_input, return_raw=True)
     trace["identity"] = {"score": id_res['similarity']}
@@ -117,6 +135,8 @@ def run_agent(user_input: str, session_id: str) -> str:
     if associative_injections:
         prompt_sections.append("[PHASE3] ASSOCIATIVE MEMORIES:\n" + "\n".join(associative_injections))
         
+    if predicted_injections:
+        prompt_sections.append("[PHASE6] PREDICTED FOLLOW-UP CONTEXT:\n" + "\n".join(predicted_injections))
     history = memory_manager.get_history(session_id, limit=10)
     prompt_sections.append("CONVERSATION HISTORY:")
     for msg in history:

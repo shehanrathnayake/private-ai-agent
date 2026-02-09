@@ -63,7 +63,8 @@ class MemoryManager:
                     last_accessed_at TEXT,
                     merged INTEGER DEFAULT 0,
                     source_vector_ids TEXT,
-                    scope TEXT DEFAULT 'session'
+                    scope TEXT DEFAULT 'session',
+                    linked_vectors TEXT
                 )
             """)
             # Migration check
@@ -77,6 +78,8 @@ class MemoryManager:
                 cursor.execute("ALTER TABLE vector_metadata ADD COLUMN source_vector_ids TEXT")
             if 'scope' not in columns:
                 cursor.execute("ALTER TABLE vector_metadata ADD COLUMN scope TEXT DEFAULT 'session'")
+            if 'linked_vectors' not in columns:
+                cursor.execute("ALTER TABLE vector_metadata ADD COLUMN linked_vectors TEXT")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS system_metadata (
                     key TEXT PRIMARY KEY,
@@ -836,6 +839,9 @@ class MemoryManager:
                     conn.commit()
                     
                 print(f"[PHASE5.3] Multi-merge complete. {merged_count} new memories active.")
+                
+                # Phase 6: Build cross-session links after compression/merge
+                self.link_cross_session_memories(top_k_neighbors=5)
             else:
                 print("[PHASE5.3] Cycle finished with no merges.")
 
@@ -844,6 +850,115 @@ class MemoryManager:
         finally:
             self._set_system_metadata("compression_in_progress", "0")
             print("[PHASE5.3] Released compression lock.")
+
+    # ===== PHASE 6: Multi-Session Reasoning =====
+
+    def link_cross_session_memories(self, top_k_neighbors: int = 5) -> None:
+        """Builds a graph of related memories across all sessions (Phase 6)."""
+        print(f"[PHASE6] Starting cross-session memory link building (top_k={top_k_neighbors})...")
+        
+        try:
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                # Get all active memories (excluding Identity and high-salience Open Threads)
+                cursor.execute("""
+                    SELECT vector_id, content, type, salience FROM vector_metadata 
+                    WHERE merged = 0 
+                    AND type != 'Identity'
+                    AND NOT (type = 'Open Threads' AND salience >= 0.8)
+                """)
+                active_memories = cursor.fetchall()
+                
+                if not active_memories:
+                    print("[PHASE6] No active memories found for linking.")
+                    return
+
+                processed_count = 0
+                for vid, content, mtype, sal in active_memories:
+                    # Query top-k neighbors
+                    # Note: query_associative already sorts and filters by threshold
+                    # But we want to find potentially older/other session memories
+                    results = self.query_associative(content, top_k=top_k_neighbors + 1)
+                    
+                    # Filter out itself and format linked vector IDs
+                    linked_ids = [r['vector_id'] for r in results if r['vector_id'] != vid]
+                    linked_ids = linked_ids[:top_k_neighbors] # Ensure it respects top_k_neighbors
+                    
+                    if linked_ids:
+                        cursor.execute(
+                            "UPDATE vector_metadata SET linked_vectors = ? WHERE vector_id = ?",
+                            (json.dumps(linked_ids), vid)
+                        )
+                        processed_count += 1
+                
+                conn.commit()
+                print(f"[PHASE6] Cross-session linking complete. Updated {processed_count} memories.")
+                
+        except Exception as e:
+            print(f"[PHASE6] Cross-session linking error: {e}")
+
+    def predictive_recall(self, user_input: str, top_k: int = 5) -> List[Dict]:
+        """Searches cross-session linked memories for vectors likely relevant to follow-up queries."""
+        print(f"[PHASE6] Performing predictive recall for input: '{user_input[:50]}...'")
+        
+        try:
+            # 1. Search for directly relevant memories
+            # We use a slightly lower threshold or maybe just the standard associative recall
+            # but look into THEIR linked vectors.
+            associative = self.get_aging_aware_associative(user_input, top_k=5)
+            if not associative:
+                return []
+
+            # 2. Extract unique linked IDs from direct matches
+            linked_ids = []
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                for mem in associative:
+                    cursor.execute("SELECT linked_vectors FROM vector_metadata WHERE vector_id = ?", (mem['vector_id'],))
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        try:
+                            ids = json.loads(row[0])
+                            linked_ids.extend(ids)
+                        except: continue
+
+            if not linked_ids:
+                return []
+
+            # 3. Fetch linked memories and score them
+            unique_linked_ids = list(set(linked_ids))
+            placeholders = ', '.join(['?'] * len(unique_linked_ids))
+            
+            predictions = []
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"""
+                    SELECT vector_id, type, content, salience FROM vector_metadata 
+                    WHERE vector_id IN ({placeholders}) AND merged = 0
+                """, unique_linked_ids)
+                rows = cursor.fetchall()
+                
+                # Use a fresh embedding for ranking if needed, or just return top by salience/similarity
+                # For Phase 6, we'll return them with a 'Predicted' label in the agent
+                for r in rows:
+                    predictions.append({
+                        "vector_id": r[0],
+                        "type": r[1],
+                        "content": r[2],
+                        "salience": r[3],
+                        "similarity": 0.0, # Placeholder, will be injected
+                        "linked_vectors": [] 
+                    })
+            
+            # Sort by salience as a proxy for 'importance' in prediction
+            predictions.sort(key=lambda x: x['salience'], reverse=True)
+            
+            print(f"[PHASE6] Predictive recall found {len(predictions[:top_k])} follow-up candidates.")
+            return predictions[:top_k]
+            
+        except Exception as e:
+            print(f"[PHASE6] Predictive recall error: {e}")
+            return []
 
 # Global instance
 memory_manager = MemoryManager()
