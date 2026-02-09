@@ -115,6 +115,24 @@ class MemoryManager:
         except Exception as e:
             print(f"[PHASE3] Failed to load index: {e}. Starting fresh.")
             self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
+            self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.dimension))
+
+        # [PHASE 5.5] Self-Healing: Repair potentially inconsistent states from previous crashes
+        self._repair_memory_state()
+
+    def _repair_memory_state(self):
+        """Fixes vector states if the system crashed during a transaction (Phase 5.5)."""
+        with sqlite3.connect(METADATA_DB_PATH) as conn:
+            cursor = conn.cursor()
+            # 1. Activate any 'Pending' (merged=2) memories (Crash after rebuild, before activation)
+            cursor.execute("UPDATE vector_metadata SET merged = 0 WHERE merged = 2")
+            if cursor.rowcount > 0:
+                print(f"[MEMORY][REPAIR] Activated {cursor.rowcount} pending memories from previous session.")
+            
+            # 2. Cleanup 'Soft Deleted' (merged=1) memories that were not purged (Crash before rebuild commit)
+            # We assume rebuild_index will run eventually, but we can leave them as merged=1 (hidden).
+            # No action needed for merged=1, handled by next rebuild.
+            conn.commit()
 
     def _get_system_metadata(self, key: str, default: str = None) -> str:
         with sqlite3.connect(METADATA_DB_PATH) as conn:
@@ -213,10 +231,7 @@ class MemoryManager:
                         cursor.execute("SELECT type, content, salience FROM vector_metadata WHERE vector_id = ? AND merged = 0", (int(idx),))
                         row = cursor.fetchone()
                         if row:
-                            # Fix 3: Update last_accessed_at for retrieved vectors
-                            now_str = datetime.now().isoformat()
-                            cursor.execute("UPDATE vector_metadata SET last_accessed_at = ? WHERE vector_id = ?", (now_str, int(idx)))
-                            
+                            # [PHASE 5.5] Recall is now read-only. No timestamp updates here.
                             results.append({
                                 "vector_id": int(idx),
                                 "type": row[0],
@@ -224,7 +239,7 @@ class MemoryManager:
                                 "salience": row[2],
                                 "similarity": float(similarity)
                             })
-                conn.commit()
+                # conn.commit() removed for read-only recall
             
             # Sort by salience then similarity
             results.sort(key=lambda x: (x['salience'], x['similarity']), reverse=True)
@@ -528,6 +543,17 @@ class MemoryManager:
             for r in repeats:
                 print(f"[PHASE3.5] WARNING: Redundant memory detected ({r[1]} instances): {r[0][:50]}...")
 
+    def is_mutation_allowed(self, mtype: str, salience: float, operation: str) -> bool:
+        """Central safety guard for memory mutations (Phase 5.5)."""
+        if mtype == "Identity":
+            return False
+            
+        if mtype == "Open Threads" and salience >= 0.8:
+            if operation in ["decay", "compression", "delete"]:
+                return False
+        
+        return True
+
     def decay_salience(self):
         """Implements time-based salience decay for associative memory using delta time."""
         print("[PHASE5] Starting salience decay process...")
@@ -578,6 +604,11 @@ class MemoryManager:
                     multiplier = multipliers.get(mtype, 1.0)
                     effective_lambda = DECAY_LAMBDA * multiplier
                     
+                    # [PHASE 5.5] Task 2: Wrap Decay with Safety
+                    if not self.is_mutation_allowed(mtype, salience, "decay"):
+                        print(f"[MEMORY][SKIP] vector_id={vid} reason=PROTECTED_TYPE_OR_STATUS")
+                        continue
+
                     # Formula: decayed_salience = current_salience * exp(-λ * delta_days)
                     new_salience = salience * math.exp(-effective_lambda * delta_days)
                     
@@ -589,7 +620,7 @@ class MemoryManager:
                     
                     if new_salience != salience:
                         cursor.execute("UPDATE vector_metadata SET salience = ? WHERE vector_id = ?", (new_salience, vid))
-                        print(f"[PHASE5] Decayed vector {vid} ({mtype}): {salience} -> {new_salience} (delta: {delta_days:.4f} days)")
+                        print(f"[MEMORY][DECAY] vector_id={vid} type={mtype} old_salience={salience} new_salience={new_salience} age_days={delta_days:.2f}")
                         decay_count += 1
                         
                 except (ValueError, TypeError):
@@ -609,19 +640,32 @@ class MemoryManager:
         try:
             with sqlite3.connect(METADATA_DB_PATH) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT salience FROM vector_metadata WHERE vector_id = ?", (vector_id,))
+                cursor.execute("SELECT salience, type FROM vector_metadata WHERE vector_id = ?", (vector_id,))
                 row = cursor.fetchone()
                 if not row: return
-
+                
                 current_salience = row[0]
+                
+                # [PHASE 5.5] Identity vectors never change except on creation
+                if not self.is_mutation_allowed("Identity" if row[1] == "Identity" else "Other", current_salience, "reinforce") and row[1] == "Identity":
+                    print(f"[MEMORY][SKIP] vector_id={vector_id} reason=IDENTITY_PROTECTED")
+                    return
+
                 new_salience = min(current_salience + amount, MAX_SALIENCE)
                 new_salience = round(new_salience, 4)
 
-                # Issue 4: Update last_accessed_at
+                # Update timestamp and salience
                 now_str = datetime.now().isoformat()
                 cursor.execute("UPDATE vector_metadata SET salience = ?, last_accessed_at = ? WHERE vector_id = ?", (new_salience, now_str, vector_id))
                 conn.commit()
-                print(f"[PHASE5] Reinforced vector {vector_id} ({source}) (+{amount} -> {new_salience})")
+                
+                # [PHASE 5.5] Task 5: Persistence Verification
+                cursor.execute("SELECT salience FROM vector_metadata WHERE vector_id = ?", (vector_id,))
+                verif = cursor.fetchone()
+                if not verif or abs(verif[0] - new_salience) > 1e-5:
+                    raise RuntimeError(f"Reinforcement persistence failed for vector {vector_id}")
+                
+                print(f"[MEMORY][REINFORCE] vector_id={vector_id} type={row[1]} old_salience={current_salience} new_salience={new_salience}")
         except Exception as e:
             print(f"[PHASE5] Reinforcement error: {e}")
 
@@ -634,7 +678,8 @@ class MemoryManager:
         with sqlite3.connect(METADATA_DB_PATH) as conn:
             cursor = conn.cursor()
             # Fix 1: Order by ID but do NOT reassign them
-            cursor.execute("SELECT content, vector_id FROM vector_metadata WHERE merged = 0 ORDER BY vector_id ASC")
+            # [PHASE 5.5] Include 'merged=2' (pending activation) in the new index
+            cursor.execute("SELECT content, vector_id FROM vector_metadata WHERE merged IN (0, 2) ORDER BY vector_id ASC")
             records = cursor.fetchall()
             
             if not records:
@@ -682,6 +727,8 @@ class MemoryManager:
             
             with sqlite3.connect(METADATA_DB_PATH) as conn:
                 cursor = conn.cursor()
+                # [PHASE 5.5] Task 3: Exclude protected vectors using SQL-side equivalent of is_mutation_allowed
+                # Also respects salience floor (0.3) and skip Merged Memory/Identity types.
                 cursor.execute("""
                     SELECT vector_id, content, salience, type FROM vector_metadata 
                     WHERE salience >= 0.3 AND salience < 0.95 
@@ -734,7 +781,7 @@ class MemoryManager:
                 group_texts = [item[1] for item in group]
                 max_salience = max(item[2] for item in group)
                 
-                print(f"[PHASE5.3][MERGE] type={mtype} ids={group_ids} start_salience={salience}")
+                print(f"[MEMORY][COMPRESS] type={mtype} merged_ids={group_ids}")
                 
                 merge_prompt = f"""
                 The following memories are semantically redundant. 
@@ -757,35 +804,37 @@ class MemoryManager:
                         new_salience = min(max_salience + COMPRESSION_SALIENCE_BOOST, MAX_SALIENCE)
                         now_str = datetime.now().isoformat()
                         
-                        # Fix 2 (Option A): Insert with merged = 1 until rebuild is complete
+                        # Fix 2 (Option A): Insert with merged = 2 (Pending) until rebuild is complete
+                        # This ensures the new memory is safe from deletions during rebuild, and included in new index.
                         cursor.execute(
                             "INSERT INTO vector_metadata (session_id, type, content, salience, timestamp, last_accessed_at, merged, source_vector_ids, scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            ("global_merge", "Merged Memory", merged_text, new_salience, now_str, now_str, 1, json.dumps(group_ids), 'global')
+                            ("global_merge", "Merged Memory", merged_text, new_salience, now_str, now_str, 2, json.dumps(group_ids), 'global')
                         )
                         new_id = cursor.lastrowid
-                        new_merged_ids.append((new_id, merged_text))
+                        new_merged_ids.append(new_id) # Store ID only
                         conn.commit()
                     
                     processed_ids.update(group_ids)
                     merged_count += 1
-                    print(f"[PHASE5.3][MERGE] SUCCESS -> new_id={new_id} preview='{merged_text[:60]}...'")
+                    print(f"[MEMORY][COMPRESS] type={mtype} merged_ids={group_ids} -> new_id={new_id}")
 
             if merged_count > 0:
-                print(f"[PHASE5.3] Groups merged. Rebuilding index to purge old vectors...")
+                print(f"[PHASE5.3] Groups merged. Rebuilding index to purge old vectors and include new ones...")
+                
+                # Rebuilds index:
+                # - Includes merged=0 (Existing Active)
+                # - Includes merged=2 (New Pending)
+                # - Deletes merged=1 (Old Sources)
                 self.rebuild_index()
                 
-                # Fix 2: Flip merged = 0 and add to FAISS after rebuild is complete
+                # Activate new memories (merged=2 -> merged=0)
+                # No need to add to FAISS manually because rebuild_index included merged=2!
                 with sqlite3.connect(METADATA_DB_PATH) as conn:
                     cursor = conn.cursor()
-                    for new_id, text in new_merged_ids:
-                        cursor.execute("UPDATE vector_metadata SET merged = 0 WHERE vector_id = ?", (new_id,))
-                        # Embed and add to FAISS manually
-                        emb = self._get_embedding(text)
-                        vec = np.array([emb]).astype('float32')
-                        faiss.normalize_L2(vec)
-                        self.index.add_with_ids(vec, np.array([new_id], dtype='int64'))
+                    placeholders = ', '.join(['?'] * len(new_merged_ids))
+                    cursor.execute(f"UPDATE vector_metadata SET merged = 0 WHERE vector_id IN ({placeholders})", new_merged_ids)
                     conn.commit()
-                faiss.write_index(self.index, VECTOR_INDEX_PATH)
+                    
                 print(f"[PHASE5.3] Multi-merge complete. {merged_count} new memories active.")
             else:
                 print("[PHASE5.3] Cycle finished with no merges.")
