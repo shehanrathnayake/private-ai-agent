@@ -34,6 +34,11 @@ def run_agent(user_input: str, session_id: str) -> str:
             res = memory_manager.get_identity(user_input, return_raw=True)
             return f"[DEBUG IDENTITY]\n\nSimilarity Score: {res['similarity']:.4f}\n\nContent:\n{res['content']}"
 
+        elif cmd == "introspection":
+            from app.introspection import Introspection
+            introspection = Introspection(memory_manager)
+            return introspection.generate_introspection_report(session_id)
+
     # 2. Save user message to SQLite
     memory_manager.add_message(session_id, "user", user_input)
     
@@ -283,3 +288,13 @@ def summarize_session(session_id: str):
         
     memory_manager.write_session_summary(session_id, final_markdown)
     print(f"[MEMORY] Summary updated successfully: memory/summaries/{session_id}.md")
+
+    # [PHASE 7] Automatic Introspection Check
+    try:
+        from app.introspection import Introspection
+        introspection = Introspection(memory_manager)
+        report = introspection.generate_introspection_report(session_id, flag_high_priority=True)
+        if "[HIGH PRIORITY]" in report or "Contradictions Detected" in report:
+            print(f"[INTROSPECTION] Report Generated:\n{report}")
+    except Exception as e:
+        print(f"[INTROSPECTION] Error during check: {e}")
