@@ -5,7 +5,7 @@ from app.openrouter import run_openrouter
 from app.config import (
     SYSTEM_PROMPT, SUMMARY_THRESHOLD, IDENTITY_UPDATE_INTERVAL,
     REINFORCE_AMOUNT_ASSOCIATIVE, REINFORCE_AMOUNT_DETERMINISTIC,
-    REINFORCE_AMOUNT_IDENTITY
+    REINFORCE_AMOUNT_IDENTITY, EFFECTIVE_THRESHOLD
 )
 from app.memory import memory_manager
 
@@ -54,21 +54,27 @@ def run_agent(user_input: str, session_id: str) -> str:
     deterministic_vector_ids = relevant_res["vector_ids"]
     trace["deterministic"] = {k: True for k in relevant_sections.keys()}
     
-    # Phase 3: Associative Recall (with confidence gating)
+    # Phase 3: Associative Recall (Aging-Aware, Phase 5.4)
     skip_content = list(relevant_sections.values())
-    raw_associative = memory_manager.get_associative_memory(user_input, skip_content=skip_content, return_raw=True)
+    raw_associative = memory_manager.get_aging_aware_associative(user_input, skip_content=skip_content)
     
     associative_injections = []
     used_associative_vector_ids = []
     for mem in raw_associative:
-        sim = mem['similarity']
-        trace["associative"].append({"content": mem['content'][:50], "sim": sim, "type": mem['type']})
-        if sim >= 0.85:
+        score = mem['effective_score']
+        trace["associative"].append({
+            "content": mem['content'][:50], 
+            "score": score, 
+            "type": mem['type']
+        })
+        
+        # Injection logic: Stronger phrasing for higher effective scores
+        if score >= 0.85:
             associative_injections.append(f"[{mem['type']}]: {mem['content']}")
-            used_associative_vector_ids.append(mem['vector_id'])
-        elif sim >= 0.70:
-            associative_injections.append(f"[{mem['type']} (Potential Match)]: I recall something similar - {mem['content']}")
-            used_associative_vector_ids.append(mem['vector_id'])
+        else:
+            associative_injections.append(f"[{mem['type']} (Recall)]: I recall something relevant - {mem['content']}")
+            
+        used_associative_vector_ids.append(mem['vector_id'])
             
     # Phase 3: Identity-Aware Recall
     id_res = memory_manager.get_identity(user_input, return_raw=True)

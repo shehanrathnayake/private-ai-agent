@@ -12,7 +12,7 @@ from app.config import (
     SIMILARITY_THRESHOLD, TOP_K_ASSOCIATIVE, IDENTITY_UPDATE_INTERVAL,
     DECAY_LAMBDA, REINFORCE_AMOUNT_ASSOCIATIVE, REINFORCE_AMOUNT_DETERMINISTIC,
     MAX_SALIENCE, MIN_SALIENCE, COMPRESSION_THRESHOLD, COMPRESSION_SALIENCE_BOOST,
-    MAX_MERGES_PER_CYCLE, MIN_INDEX_SIZE_FOR_COMPRESSION
+    MAX_MERGES_PER_CYCLE, MIN_INDEX_SIZE_FOR_COMPRESSION, EFFECTIVE_THRESHOLD
 )
 
 DB_PATH = "memory/agent_memory.db"
@@ -359,6 +359,42 @@ class MemoryManager:
             query = f"SELECT vector_id FROM vector_metadata WHERE {clause.format(placeholders)}"
             cursor.execute(query, params)
             return [row[0] for row in cursor.fetchall()]
+
+    def get_aging_aware_associative(self, user_input: str, skip_content: List[str] = None, 
+                                   top_k: int = TOP_K_ASSOCIATIVE, effective_threshold: float = EFFECTIVE_THRESHOLD) -> List[Dict]:
+        """Returns associative memories weighted by their current salience (Phase 5.4)."""
+        skip_content = skip_content or []
+        
+        # Step 1: Get raw results (grab extra for filtering)
+        raw_results = self.query_associative(user_input, top_k=top_k * 2)
+        filtered_results = []
+        
+        for v in raw_results:
+            # Skip if already injected in Deterministic recall
+            if v['content'] in skip_content:
+                continue
+                
+            # Skip Identity (handled separately) and high-salience Open Threads (Phase 5 safety)
+            if v['type'] == "Identity" or (v['type'] == "Open Threads" and v['salience'] >= 0.8):
+                continue
+                
+            # Calculate Effective Score: Similarity * Salience
+            effective_score = v['similarity'] * v['salience']
+            
+            if effective_score >= effective_threshold:
+                v['effective_score'] = round(effective_score, 4)
+                filtered_results.append(v)
+                print(f"[PHASE5.4] Vector {v['vector_id']} ({v['type']}) qualified: effective_score={v['effective_score']:.3f} (sim={v['similarity']:.2f}, sal={v['salience']:.2f})")
+            else:
+                # Debug logging for aging-aware skip
+                if v['similarity'] >= SIMILARITY_THRESHOLD:
+                    print(f"[PHASE5.4] Vector {v['vector_id']} ({v['type']}) aged out: effective_score={effective_score:.3f} < {effective_threshold}")
+
+        # Step 2: Sort by effective_score descending
+        filtered_results.sort(key=lambda x: x['effective_score'], reverse=True)
+        
+        # Step 3: Limit and return
+        return filtered_results[:top_k]
 
     def get_associative_memory(self, user_input: str, skip_content: List[str] = None, return_raw: bool = False) -> Any:
         results = self.query_associative(user_input)
