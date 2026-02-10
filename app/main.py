@@ -2,6 +2,10 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from app.agent import run_agent
 from app.config import APP_HOST, APP_PORT
+from app.bootstrap import ensure_runtime_environment
+
+# Ensure filesystem is ready before anything else
+ensure_runtime_environment()
 
 app = FastAPI(title="Private AI Agent API")
 

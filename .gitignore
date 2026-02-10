@@ -11,9 +11,12 @@ dist/
 *.db
 *.db-journal
 
-# Project specific
-memory/agent_memory.db
-memory/summaries/*.md
+# Project specific (Data & Logs)
+memory/*
+!memory/.gitkeep
+!memory/knowledge.md
+# knowledge.md is committed with defaults as per contract, others in memory/ are ignored
+
+# Debug/Helper scripts
 debug_*.py
 check_db.py
-memory/*

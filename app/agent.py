@@ -11,6 +11,10 @@ from app.memory import memory_manager
 
 from app.tools import tool_manager
 
+from app.bootstrap import (
+    IDENTITY_FILE
+)
+
 # global trace for debugging
 LAST_TRACE = {}
 
@@ -23,8 +27,8 @@ def run_agent(user_input: str, session_id: str) -> str:
         if cmd == "memory":
             summary = memory_manager.get_summary(session_id)
             identity = ""
-            if os.path.exists("memory/identity.md"):
-                with open("memory/identity.md", "r") as f: identity = f.read()
+            if os.path.exists(IDENTITY_FILE):
+                with open(IDENTITY_FILE, "r") as f: identity = f.read()
             return f"[DEBUG MEMORY]\n\nSESSION SUMMARY:\n{summary}\n\nIDENTITY:\n{identity}"
         
         elif cmd == "trace":
@@ -287,7 +291,8 @@ def summarize_session(session_id: str):
         final_markdown = new_summary.strip() + f"\n\n## Last Updated\n{timestamp}"
         
     memory_manager.write_session_summary(session_id, final_markdown)
-    print(f"[MEMORY] Summary updated successfully: memory/summaries/{session_id}.md")
+    from app.bootstrap import SUMMARIES_DIR
+    print(f"[MEMORY] Summary updated successfully: {SUMMARIES_DIR}/{session_id}.md")
 
     # [PHASE 7] Automatic Introspection Check
     try:

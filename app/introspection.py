@@ -4,13 +4,11 @@ import datetime
 from typing import Dict, List, Tuple
 from app.memory import MemoryManager, IDENTITY_FILE_PATH, SUMMARIES_PATH
 
-REPORTS_PATH = "memory/reports"
+from app.bootstrap import REPORTS_DIR as REPORTS_PATH
 
 class Introspection:
     def __init__(self, memory_manager: MemoryManager):
         self.mm = memory_manager
-        if not os.path.exists(REPORTS_PATH):
-            os.makedirs(REPORTS_PATH)
 
     def _get_sorted_session_files(self) -> List[str]:
         """Returns a list of session summary filenames sorted by modification time (descending)."""

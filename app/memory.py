@@ -15,11 +15,15 @@ from app.config import (
     MAX_MERGES_PER_CYCLE, MIN_INDEX_SIZE_FOR_COMPRESSION, EFFECTIVE_THRESHOLD
 )
 
-DB_PATH = "memory/agent_memory.db"
-SUMMARIES_PATH = "memory/summaries"
+from app.bootstrap import (
+    SUMMARIES_DIR, MODELS_DIR, KNOWLEDGE_FILE, IDENTITY_FILE, AGENT_DB
+)
+
+DB_PATH = AGENT_DB
+SUMMARIES_PATH = SUMMARIES_DIR
 VECTOR_INDEX_PATH = os.path.join(VECTOR_DB_PATH, "faiss.index")
 METADATA_DB_PATH = os.path.join(VECTOR_DB_PATH, "metadata.db")
-IDENTITY_FILE_PATH = "memory/identity.md"
+IDENTITY_FILE_PATH = IDENTITY_FILE
 
 class MemoryManager:
     def __init__(self):
@@ -27,9 +31,6 @@ class MemoryManager:
         self.dimension = EMBEDDING_DIMENSION
         self.model = None # Lazy load on first use
         self._init_vector_db()
-        
-        if not os.path.exists(SUMMARIES_PATH):
-            os.makedirs(SUMMARIES_PATH)
 
     def _init_db(self):
         with sqlite3.connect(DB_PATH) as conn:
@@ -153,10 +154,8 @@ class MemoryManager:
     def _get_model(self):
         if self.model is None:
             print(f"[PHASE3] Loading local embedding model: {EMBEDDING_MODEL} (this may take a minute)...")
-            # Save model to memory volume to avoid re-downloads
-            model_path = os.path.join("memory", "models")
-            if not os.path.exists(model_path): os.makedirs(model_path)
-            self.model = SentenceTransformer(EMBEDDING_MODEL, cache_folder=model_path)
+            # Save model to directory to avoid re-downloads
+            self.model = SentenceTransformer(EMBEDDING_MODEL, cache_folder=MODELS_DIR)
         return self.model
 
     def _get_embedding(self, text: str) -> List[float]:
@@ -316,7 +315,7 @@ class MemoryManager:
         return int(self._get_system_metadata("summary_update_count", "0"))
 
     def get_knowledge(self) -> str:
-        knowledge_file = "memory/knowledge.md"
+        knowledge_file = KNOWLEDGE_FILE
         if os.path.exists(knowledge_file):
             with open(knowledge_file, "r", encoding="utf-8") as f:
                 return f.read()

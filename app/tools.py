@@ -5,8 +5,10 @@ from datetime import datetime
 import sqlite3
 from app.config import VECTOR_DB_PATH
 
+from app.bootstrap import TOOL_AUDIT_LOG, AGENT_DB
+
 # Setup tool audit logging
-LOG_FILE = "memory/tool_audit.log"
+LOG_FILE = TOOL_AUDIT_LOG
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -17,7 +19,7 @@ class ToolManager:
     """
     Manages registration, schema discovery, and safe execution of agent tools.
     """
-    def __init__(self, db_path: str = "memory/agent_memory.db"):
+    def __init__(self, db_path: str = AGENT_DB):
         self.tools: Dict[str, Dict[str, Any]] = {}
         self.db_path = db_path
         self._init_audit_table()
@@ -132,7 +134,7 @@ class ToolManager:
 
 def set_reminder(session_id: str, content: str, due_date: str = "TBD"):
     """Saves a reminder to the local database."""
-    with sqlite3.connect("memory/agent_memory.db") as conn:
+    with sqlite3.connect(AGENT_DB) as conn:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO reminders (session_id, content, due_date) VALUES (?, ?, ?)",
@@ -143,7 +145,7 @@ def set_reminder(session_id: str, content: str, due_date: str = "TBD"):
 
 def create_task(session_id: str, title: str, priority: str = "medium"):
     """Creates a task in the tracking system."""
-    with sqlite3.connect("memory/agent_memory.db") as conn:
+    with sqlite3.connect(AGENT_DB) as conn:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO tasks (session_id, title, priority) VALUES (?, ?, ?)",
