@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import json
+import threading
 import numpy as np
 import math
 import faiss
@@ -12,7 +13,8 @@ from app.config import (
     SIMILARITY_THRESHOLD, TOP_K_ASSOCIATIVE, IDENTITY_UPDATE_INTERVAL,
     DECAY_LAMBDA, REINFORCE_AMOUNT_ASSOCIATIVE, REINFORCE_AMOUNT_DETERMINISTIC,
     MAX_SALIENCE, MIN_SALIENCE, COMPRESSION_THRESHOLD, COMPRESSION_SALIENCE_BOOST,
-    MAX_MERGES_PER_CYCLE, MIN_INDEX_SIZE_FOR_COMPRESSION, EFFECTIVE_THRESHOLD
+    MAX_MERGES_PER_CYCLE, MIN_INDEX_SIZE_FOR_COMPRESSION, EFFECTIVE_THRESHOLD,
+    INNER_THOUGHT_MAX_COUNT, INNER_THOUGHT_SALIENCE
 )
 
 from app.bootstrap import (
@@ -27,6 +29,7 @@ IDENTITY_FILE_PATH = IDENTITY_FILE
 
 class MemoryManager:
     def __init__(self):
+        self._faiss_lock = threading.Lock()  # Guards all FAISS write operations
         self._init_db()
         self.dimension = EMBEDDING_DIMENSION
         self.model = None # Lazy load on first use
@@ -186,6 +189,9 @@ class MemoryManager:
         embedding = self._get_embedding(text)
         if all(v == 0.0 for v in embedding):
             return
+
+        # Determine scope: inner thoughts use 'global', regular memories use 'session'
+        scope = 'global' if session_id == '__inner__' else 'session'
             
         try:
             vector = np.array([embedding]).astype('float32')
@@ -195,16 +201,17 @@ class MemoryManager:
                 cursor = conn.cursor()
                 cursor.execute(
                     "INSERT INTO vector_metadata (session_id, type, content, salience, timestamp, scope) VALUES (?, ?, ?, ?, ?, ?)",
-                    (session_id, mem_type, text, salience, datetime.now().isoformat(), 'session')
+                    (session_id, mem_type, text, salience, datetime.now().isoformat(), scope)
                 )
                 vector_id = cursor.lastrowid
                 conn.commit()
 
-            # Now add to FAISS with the permanent SQLite ID
-            self.index.add_with_ids(vector, np.array([vector_id], dtype='int64'))
-            faiss.write_index(self.index, VECTOR_INDEX_PATH)
+            # Thread-safe FAISS write
+            with self._faiss_lock:
+                self.index.add_with_ids(vector, np.array([vector_id], dtype='int64'))
+                faiss.write_index(self.index, VECTOR_INDEX_PATH)
             
-            print(f"[PHASE3] Vector {vector_id} added: Type={mem_type}, Salience={salience}")
+            print(f"[PHASE3] Vector {vector_id} added: Type={mem_type}, Salience={salience}, Scope={scope}")
         except Exception as e:
             print(f"[PHASE3] Error adding vector: {e}")
 
@@ -566,11 +573,14 @@ class MemoryManager:
         last_run = datetime.fromisoformat(last_run_str) if last_run_str else None
         
         # Decay Multipliers per Requirement
+        # Inner thought types decay faster (INNER_THOUGHT_DECAY_MULT = 2.0 default)
         multipliers = {
             "Open Threads": 0.5,
             "Preferences": 1.0,
             "Known Facts": 1.2,
-            "Tool History": 1.5
+            "Tool History": 1.5,
+            "Inner Thought": 2.0,   # Decays fastest — must be reinforced by real conversation
+            "Reflection": 1.8,      # Slightly slower than raw thoughts
         }
         
         with sqlite3.connect(METADATA_DB_PATH) as conn:
@@ -1024,6 +1034,102 @@ class MemoryManager:
         final_summary += "\n\n#####################################"
         
         return final_summary
+
+    def get_recent_inner_thoughts(self, top_k: int = 2, user_input: str = "") -> str:
+        """
+        Returns the most recent, highest-salience inner thoughts for prompt injection.
+        If user_input is provided, only returns thoughts semantically similar to it
+        (similarity-gated injection — Option 2 from the design plan).
+        """
+        try:
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT vector_id, content, salience, timestamp
+                    FROM vector_metadata
+                    WHERE session_id = '__inner__'
+                      AND merged = 0
+                      AND type IN ('Inner Thought', 'Reflection')
+                    ORDER BY salience DESC, timestamp DESC
+                    LIMIT ?
+                """, (top_k * 3,))  # Fetch extra for similarity filtering
+                rows = cursor.fetchall()
+
+            if not rows:
+                return ""
+
+            # If a user input is provided, apply similarity gate
+            if user_input.strip():
+                from app.config import INNER_THOUGHT_INJECT_THRESHOLD
+                embedding_ui = self._get_embedding(user_input)
+                vec_ui = np.array([embedding_ui]).astype('float32')
+                faiss.normalize_L2(vec_ui)
+
+                filtered = []
+                for vid, content, salience, ts in rows:
+                    embedding_t = self._get_embedding(content)
+                    vec_t = np.array([embedding_t]).astype('float32')
+                    faiss.normalize_L2(vec_t)
+                    sim = float(np.dot(vec_ui, vec_t.T)[0][0])
+                    if sim >= INNER_THOUGHT_INJECT_THRESHOLD:
+                        filtered.append((content, salience, sim))
+
+                if not filtered:
+                    return ""
+
+                # Sort by similarity * salience, take top_k
+                filtered.sort(key=lambda x: x[1] * x[2], reverse=True)
+                selected = filtered[:top_k]
+            else:
+                # No gate — just take top_k by salience
+                selected = [(r[1], r[2], 1.0) for r in rows[:top_k]]
+
+            lines = [f"- {content}" for content, salience, _ in selected]
+            return "MY RECENT THOUGHTS (private context):\n" + "\n".join(lines)
+
+        except Exception as e:
+            print(f"[INNER] get_recent_inner_thoughts error: {e}")
+            return ""
+
+    def prune_inner_thoughts(self):
+        """
+        Enforces the INNER_THOUGHT_MAX_COUNT cap.
+        Deletes the lowest-salience inner thoughts when over the limit.
+        Called by the inner loop after each store operation.
+        """
+        try:
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT COUNT(*) FROM vector_metadata
+                    WHERE session_id = '__inner__' AND merged = 0
+                """)
+                count = cursor.fetchone()[0]
+
+                if count <= INNER_THOUGHT_MAX_COUNT:
+                    return
+
+                excess = count - INNER_THOUGHT_MAX_COUNT
+                # Delete the lowest-salience thoughts first
+                cursor.execute("""
+                    SELECT vector_id FROM vector_metadata
+                    WHERE session_id = '__inner__' AND merged = 0
+                    ORDER BY salience ASC, timestamp ASC
+                    LIMIT ?
+                """, (excess,))
+                ids_to_delete = [row[0] for row in cursor.fetchall()]
+
+                if ids_to_delete:
+                    placeholders = ','.join(['?'] * len(ids_to_delete))
+                    cursor.execute(
+                        f"DELETE FROM vector_metadata WHERE vector_id IN ({placeholders})",
+                        ids_to_delete
+                    )
+                    conn.commit()
+                    print(f"[INNER] Pruned {len(ids_to_delete)} excess inner thoughts (cap={INNER_THOUGHT_MAX_COUNT}).")
+        except Exception as e:
+            print(f"[INNER] prune_inner_thoughts error: {e}")
+
 
 # Global instance
 memory_manager = MemoryManager()

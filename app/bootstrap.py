@@ -5,6 +5,7 @@ MEMORY_DIR = "memory"
 SUMMARIES_DIR = os.path.join(MEMORY_DIR, "summaries")
 MODELS_DIR = os.path.join(MEMORY_DIR, "models")
 REPORTS_DIR = os.path.join(MEMORY_DIR, "reports")
+THOUGHTS_DIR = os.path.join(MEMORY_DIR, "thoughts")
 
 KNOWLEDGE_FILE = os.path.join(MEMORY_DIR, "knowledge.md")
 IDENTITY_FILE = os.path.join(MEMORY_DIR, "identity.md")
@@ -24,7 +25,8 @@ def ensure_runtime_environment() -> None:
     directories = [
         SUMMARIES_DIR,
         MODELS_DIR,
-        REPORTS_DIR
+        REPORTS_DIR,
+        THOUGHTS_DIR
     ]
     
     # 3. Migration logic: Move existing data from root back to memory/ if they exist in root

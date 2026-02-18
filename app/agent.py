@@ -43,6 +43,20 @@ def run_agent(user_input: str, session_id: str) -> str:
             introspection = Introspection(memory_manager)
             return introspection.generate_introspection_report(session_id)
 
+        elif cmd == "thoughts":
+            thoughts = memory_manager.get_recent_inner_thoughts(top_k=5)
+            if thoughts:
+                return f"[DEBUG THOUGHTS]\n\n{thoughts}"
+            return "[DEBUG THOUGHTS]\n\nNo inner thoughts stored yet."
+
+        elif cmd == "loop":
+            try:
+                from app.inner_loop import inner_loop_instance
+                status = inner_loop_instance.get_status() if inner_loop_instance else "Not initialized"
+                return f"[DEBUG LOOP]\n\n{status}"
+            except ImportError:
+                return "[DEBUG LOOP]\n\nInner loop module not yet active (Phase C)."
+
     # 2. Save user message to SQLite
     memory_manager.add_message(session_id, "user", user_input)
     
@@ -121,6 +135,11 @@ def run_agent(user_input: str, session_id: str) -> str:
     
     if cross_session_summary:
         prompt_sections.append(cross_session_summary)
+
+    # Phase A4: Inner Thought Injection (similarity-gated)
+    inner_thoughts = memory_manager.get_recent_inner_thoughts(top_k=2, user_input=user_input)
+    if inner_thoughts:
+        prompt_sections.append(inner_thoughts)
         
     history = memory_manager.get_history(session_id, limit=10)
     prompt_sections.append("CONVERSATION HISTORY:")

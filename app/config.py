@@ -27,3 +27,11 @@ COMPRESSION_SALIENCE_BOOST = 0.05
 MAX_MERGES_PER_CYCLE = 5
 MIN_INDEX_SIZE_FOR_COMPRESSION = 10
 EFFECTIVE_THRESHOLD = 0.7
+
+# --- Inner Monologue System ---
+INNER_LOOP_ENABLED       = os.getenv("INNER_LOOP_ENABLED", "true").lower() == "true"
+INNER_LOOP_INTERVAL      = int(os.getenv("INNER_LOOP_INTERVAL", 300))    # seconds between thought cycles
+INNER_THOUGHT_SALIENCE   = float(os.getenv("INNER_THOUGHT_SALIENCE", 0.3))  # thoughts start low-salience
+INNER_THOUGHT_MAX_COUNT  = int(os.getenv("INNER_THOUGHT_MAX_COUNT", 20))  # cap on stored thoughts
+INNER_THOUGHT_DECAY_MULT = float(os.getenv("INNER_THOUGHT_DECAY_MULT", 2.0))  # decay faster than regular memories
+INNER_THOUGHT_INJECT_THRESHOLD = float(os.getenv("INNER_THOUGHT_INJECT_THRESHOLD", 0.6))  # similarity gate for prompt injection
