@@ -44,10 +44,81 @@ def run_agent(user_input: str, session_id: str) -> str:
             return introspection.generate_introspection_report(session_id)
 
         elif cmd == "thoughts":
-            thoughts = memory_manager.get_recent_inner_thoughts(top_k=5)
-            if thoughts:
-                return f"[DEBUG THOUGHTS]\n\n{thoughts}"
-            return "[DEBUG THOUGHTS]\n\nNo inner thoughts stored yet."
+            # Sub-command: /debug thoughts [clear|journal]
+            parts = user_input.strip().split()
+            sub = parts[2].lower() if len(parts) > 2 else ""
+
+            if sub == "clear":
+                try:
+                    import sqlite3
+                    from app.memory import METADATA_DB_PATH
+                    with sqlite3.connect(METADATA_DB_PATH) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "DELETE FROM vector_metadata WHERE session_id = '__inner__'"
+                        )
+                        deleted = cursor.rowcount
+                        conn.commit()
+                    return (f"[DEBUG THOUGHTS] Cleared {deleted} inner thought(s) from memory.\n"
+                            f"Note: FAISS index will be rebuilt on next restart.")
+                except Exception as e:
+                    return f"[DEBUG THOUGHTS] Clear failed: {e}"
+
+            elif sub == "journal":
+                try:
+                    import os
+                    from datetime import datetime
+                    from app.bootstrap import THOUGHTS_DIR
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    journal_path = os.path.join(THOUGHTS_DIR, f"{today}.md")
+                    if os.path.exists(journal_path):
+                        with open(journal_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        return f"[DEBUG THOUGHTS — JOURNAL {today}]\n\n{content}"
+                    return f"[DEBUG THOUGHTS] No journal file for today ({today}) yet."
+                except Exception as e:
+                    return f"[DEBUG THOUGHTS] Journal read failed: {e}"
+
+            else:
+                # Default: show stored thoughts with full detail
+                try:
+                    import sqlite3
+                    from app.memory import METADATA_DB_PATH
+                    with sqlite3.connect(METADATA_DB_PATH) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT content, salience, timestamp
+                            FROM vector_metadata
+                            WHERE session_id = '__inner__' AND merged = 0
+                              AND type IN ('Inner Thought', 'Reflection')
+                            ORDER BY salience DESC, timestamp DESC
+                            LIMIT 10
+                        """)
+                        rows = cursor.fetchall()
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM vector_metadata WHERE session_id = '__inner__' AND merged = 0"
+                        )
+                        total = cursor.fetchone()[0]
+
+                    if not rows:
+                        return "[DEBUG THOUGHTS]\n\nNo inner thoughts stored yet."
+
+                    lines = [f"[DEBUG THOUGHTS] {total} thought(s) stored (showing top 10 by salience)\n"]
+                    for i, (content, salience, ts) in enumerate(rows, 1):
+                        # Trim timestamp to HH:MM on date
+                        try:
+                            from datetime import datetime
+                            dt = datetime.fromisoformat(ts)
+                            ts_fmt = dt.strftime("%b %d %H:%M")
+                        except Exception:
+                            ts_fmt = ts[:16]
+                        lines.append(f"{i}. [{ts_fmt}] salience={salience:.2f}")
+                        lines.append(f"   {content}")
+                        lines.append("")
+                    return "\n".join(lines)
+
+                except Exception as e:
+                    return f"[DEBUG THOUGHTS] Read failed: {e}"
 
         elif cmd == "loop":
             try:
