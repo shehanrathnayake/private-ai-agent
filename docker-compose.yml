@@ -5,6 +5,10 @@ services:
       - "8000:8000"
     volumes:
       - ./memory:/app/memory
+      - hf_cache:/root/.cache/huggingface # persists model across rebuilds
     env_file:
       - .env
     restart: always
+
+volumes:
+  hf_cache: # named volume — survives docker compose up --build

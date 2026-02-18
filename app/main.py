@@ -7,6 +7,16 @@ from app.bootstrap import ensure_runtime_environment
 # Ensure filesystem is ready before anything else
 ensure_runtime_environment()
 
+# --- Inner Monologue: start background thinking thread ---
+from app.memory import memory_manager
+from app.inner_loop import InnerLoop
+import app.inner_loop as _inner_loop_module
+
+_loop = InnerLoop(memory_manager)
+_inner_loop_module.inner_loop_instance = _loop  # expose for /debug loop
+_loop.start()
+# ---------------------------------------------------------
+
 app = FastAPI(title="Private AI Agent API")
 
 class ChatRequest(BaseModel):
@@ -28,3 +38,4 @@ def ask(req: ChatRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host=APP_HOST, port=APP_PORT)
+
