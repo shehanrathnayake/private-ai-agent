@@ -67,7 +67,6 @@ def run_agent(user_input: str, session_id: str) -> str:
             elif sub == "journal":
                 try:
                     import os
-                    from datetime import datetime
                     from app.bootstrap import THOUGHTS_DIR
                     today = datetime.now().strftime("%Y-%m-%d")
                     journal_path = os.path.join(THOUGHTS_DIR, f"{today}.md")
@@ -107,7 +106,6 @@ def run_agent(user_input: str, session_id: str) -> str:
                     for i, (content, salience, ts) in enumerate(rows, 1):
                         # Trim timestamp to HH:MM on date
                         try:
-                            from datetime import datetime
                             dt = datetime.fromisoformat(ts)
                             ts_fmt = dt.strftime("%b %d %H:%M")
                         except Exception:
