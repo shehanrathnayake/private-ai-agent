@@ -18,7 +18,7 @@ from app.config import (
 )
 
 from app.bootstrap import (
-    SUMMARIES_DIR, MODELS_DIR, KNOWLEDGE_FILE, IDENTITY_FILE, AGENT_DB
+    SUMMARIES_DIR, MODELS_DIR, KNOWLEDGE_FILE, IDENTITY_FILE, BEHAVIORAL_RULES_FILE, AGENT_DB
 )
 
 DB_PATH = AGENT_DB
@@ -26,6 +26,7 @@ SUMMARIES_PATH = SUMMARIES_DIR
 VECTOR_INDEX_PATH = os.path.join(VECTOR_DB_PATH, "faiss.index")
 METADATA_DB_PATH = os.path.join(VECTOR_DB_PATH, "metadata.db")
 IDENTITY_FILE_PATH = IDENTITY_FILE
+BEHAVIORAL_RULES_FILE_PATH = BEHAVIORAL_RULES_FILE
 
 class MemoryManager:
     def __init__(self):
@@ -325,6 +326,13 @@ class MemoryManager:
         knowledge_file = KNOWLEDGE_FILE
         if os.path.exists(knowledge_file):
             with open(knowledge_file, "r", encoding="utf-8") as f:
+                return f.read()
+        return ""
+
+    def get_behavioral_rules(self) -> str:
+        rules_file = BEHAVIORAL_RULES_FILE_PATH
+        if os.path.exists(rules_file):
+            with open(rules_file, "r", encoding="utf-8") as f:
                 return f.read()
         return ""
 
@@ -1085,7 +1093,14 @@ class MemoryManager:
                 selected = [(r[1], r[2], 1.0) for r in rows[:top_k]]
 
             lines = [f"- {content}" for content, salience, _ in selected]
-            return "MY RECENT THOUGHTS (private context):\n" + "\n".join(lines)
+            header = (
+                "[INTERNAL CONTEXT — DO NOT REPEAT IN RESPONSE]\n"
+                "The following are your private background thoughts. "
+                "Use them silently to inform your reply. "
+                "Never quote or echo these sections to the user.\n"
+                "MY RECENT THOUGHTS:\n"
+            )
+            return header + "\n".join(lines) + "\n[END INTERNAL CONTEXT]"
 
         except Exception as e:
             print(f"[INNER] get_recent_inner_thoughts error: {e}")

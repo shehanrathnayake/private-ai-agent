@@ -9,6 +9,7 @@ THOUGHTS_DIR = os.path.join(MEMORY_DIR, "thoughts")
 
 KNOWLEDGE_FILE = os.path.join(MEMORY_DIR, "knowledge.md")
 IDENTITY_FILE = os.path.join(MEMORY_DIR, "identity.md")
+BEHAVIORAL_RULES_FILE = os.path.join(MEMORY_DIR, "behavioral_rules.md")
 AGENT_DB = os.path.join(MEMORY_DIR, "agent_memory.db")
 TOOL_AUDIT_LOG = os.path.join(MEMORY_DIR, "tool_audit.log")
 
@@ -79,6 +80,10 @@ def ensure_runtime_environment() -> None:
                 f.write("# Knowledge Base\n")
         except Exception as e:
             raise RuntimeError(f"Failed to create required file {KNOWLEDGE_FILE}: {e}")
+
+    if not os.path.exists(BEHAVIORAL_RULES_FILE):
+        with open(BEHAVIORAL_RULES_FILE, "w", encoding="utf-8") as f:
+            f.write("# Behavioral Rules\n*Learned from user interaction and feedback*\n")
 
     # 6. Ensure sub-directories
     os.makedirs(os.path.join(MEMORY_DIR, "vector_index"), exist_ok=True)

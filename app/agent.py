@@ -198,6 +198,11 @@ def run_agent(user_input: str, session_id: str) -> str:
     
     if knowledge: prompt_sections.append(f"CORE KNOWLEDGE:\n{knowledge}")
     if identity_prompt: prompt_sections.append(identity_prompt)
+    
+    # Behavioral Rules (Phase E)
+    behavioral_rules = memory_manager.get_behavioral_rules()
+    if behavioral_rules:
+        prompt_sections.append(f"[BEHAVIORAL RULES]:\n{behavioral_rules}")
     if relevant_sections:
         relevant_text = "\n\n".join([f"RECALLED {k.upper()}:\n{v}" for k, v in relevant_sections.items()])
         prompt_sections.append(f"RELEVANT SESSION MEMORY:\n{relevant_text}")
@@ -282,36 +287,56 @@ def run_agent(user_input: str, session_id: str) -> str:
             print(f"[PHASE4] General Tool Error: {e}")
             final_output = agent_response + f"\n\n[SYSTEM] Internal error during action processing."
 
-    LAST_TRACE = trace 
-    memory_manager.add_message(session_id, "assistant", final_output)
-    
-    # 8. Phase 5.2: Memory Reinforcement
-    # Reinforce memories that were successfully recalled and used this turn
-    # Use sets to avoid duplicate reinforcement in the same turn (Issue 6)
-    for vid in set(used_associative_vector_ids):
-        memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_ASSOCIATIVE, source="associative")
-    for vid in set(deterministic_vector_ids):
-        memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_DETERMINISTIC, source="deterministic")
-    for vid in set(used_identity_vector_ids):
-        memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_IDENTITY, source="identity")
+    LAST_TRACE = trace
 
-    # 9. Periodic Maintenance
-    try:
-        msg_count = memory_manager.get_message_count(session_id)
-        if msg_count > 0 and msg_count % SUMMARY_THRESHOLD == 0:
-            print(f"[MEMORY] Maintenance cycle triggered ({msg_count} msgs)")
-            summarize_session(session_id)
-            memory_manager.detect_drift(session_id)
-            memory_manager.decay_salience()
-            memory_manager.compress_and_merge_memory()
-            
-            # Identity formation triggers based on total summary volume (experience), not file count.
-            update_count = memory_manager.get_summary_update_count()
-            if update_count > 0 and update_count % IDENTITY_UPDATE_INTERVAL == 0:
-                memory_manager.update_identity()
-    except Exception as e:
-        print(f"[MEMORY] Maintenance Error: {e}")
-        
+    # Guard: detect API/LLM error responses — do NOT store them in memory.
+    # Error strings poison message history, summaries, and associative memory.
+    # The user still sees the error, but it stays ephemeral.
+    _ERROR_PREFIXES = (
+        "Error calling OpenRouter API:",
+        "Error calling Gemini API:",
+        "[SYSTEM] Internal error",
+    )
+    is_error_response = any(final_output.startswith(p) for p in _ERROR_PREFIXES)
+
+    if not is_error_response:
+        memory_manager.add_message(session_id, "assistant", final_output)
+    else:
+        print(f"[AGENT] Error response detected — skipping memory storage. ({final_output[:80]}...)")
+    
+    # 8. Phase 5.2: Memory Reinforcement + Maintenance — skip entirely on error responses
+    if not is_error_response:
+        # Reinforce memories that were successfully recalled and used this turn
+        # Use sets to avoid duplicate reinforcement in the same turn (Issue 6)
+        for vid in set(used_associative_vector_ids):
+            memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_ASSOCIATIVE, source="associative")
+        for vid in set(deterministic_vector_ids):
+            memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_DETERMINISTIC, source="deterministic")
+        for vid in set(used_identity_vector_ids):
+            memory_manager.reinforce_memory(vid, REINFORCE_AMOUNT_IDENTITY, source="identity")
+
+        # 9. Periodic Maintenance
+        try:
+            msg_count = memory_manager.get_message_count(session_id)
+            if msg_count > 0 and msg_count % SUMMARY_THRESHOLD == 0:
+                print(f"[MEMORY] Maintenance cycle triggered ({msg_count} msgs)")
+                summarize_session(session_id)
+                memory_manager.detect_drift(session_id)
+                memory_manager.decay_salience()
+                memory_manager.compress_and_merge_memory()
+
+                # Identity and Behavioral Rule formation
+                update_count = memory_manager.get_summary_update_count()
+                if update_count > 0 and update_count % IDENTITY_UPDATE_INTERVAL == 0:
+                    memory_manager.update_identity()
+                    
+                    # Consolidate Behavioral Rules (Phase E)
+                    from app.introspection import Introspection
+                    ins = Introspection(memory_manager)
+                    ins.consolidate_behavioral_rules()
+        except Exception as e:
+            print(f"[MEMORY] Maintenance Error: {e}")
+
     return final_output
 
 def summarize_session(session_id: str):

@@ -2,7 +2,7 @@ import os
 import re
 import datetime
 from typing import Dict, List, Tuple
-from app.memory import MemoryManager, IDENTITY_FILE_PATH, SUMMARIES_PATH
+from app.memory import MemoryManager, IDENTITY_FILE_PATH, SUMMARIES_PATH, BEHAVIORAL_RULES_FILE_PATH
 
 from app.bootstrap import REPORTS_DIR as REPORTS_PATH
 
@@ -178,6 +178,72 @@ class Introspection:
                  drift_report[p_file] = "All past preferences dropped in current session."
 
         return drift_report
+
+    def consolidate_behavioral_rules(self, lookback: int = 3):
+        """
+        Extracts explicit behavioral rules/corrections from recent summaries.
+        Updates behavioral_rules.md with new habits learned from the user.
+        """
+        from app.openrouter import run_openrouter
+        
+        all_files = self._get_sorted_session_files()
+        past_files = all_files[:lookback]
+        
+        if not past_files:
+            return
+
+        summaries_context = []
+        for f_name in past_files:
+            with open(os.path.join(SUMMARIES_PATH, f_name), "r", encoding="utf-8") as f:
+                summaries_context.append(f"SESSION {f_name}:\n{f.read()}")
+
+        current_rules = ""
+        if os.path.exists(BEHAVIORAL_RULES_FILE_PATH):
+            with open(BEHAVIORAL_RULES_FILE_PATH, "r", encoding="utf-8") as f:
+                current_rules = f.read()
+
+        context_text = "\n\n".join(summaries_context)
+        
+        prompt = f"""
+        You are the 'Rule Consolidation' module of an AI agent. 
+        Your task is to identify specific behavioral corrections or formatting rules the user has given in recent interactions.
+        
+        CONTEXT (Recent Summaries):
+        {context_text}
+        
+        EXISTING RULES:
+        {current_rules}
+        
+        TASK:
+        1. Identify any new rules or corrections (e.g., 'Do not echo thoughts', 'Use more emojis', 'Be extremely technical').
+        2. Merge them with the EXISTING RULES.
+        3. Remove redundant or outdated rules.
+        4. Focus on 'How' to behave, not 'What' the user likes (those belong in preferences).
+        
+        Return the complete updated Markdown content for 'behavioral_rules.md'. 
+        Start with '# Behavioral Rules'. Keep it concise and bulleted.
+        """
+        
+        new_content = run_openrouter(prompt)
+        
+        if new_content and "# Behavioral Rules" in new_content:
+            # Clean up potential LLM conversational prefix
+            if "```markdown" in new_content:
+                new_content = new_content.split("```markdown")[1].split("```")[0].strip()
+            elif "```" in new_content:
+                new_content = new_content.split("```")[1].split("```")[0].strip()
+            
+            # Final check to ensure we only have the markdown content
+            match = re.search(r"(# Behavioral Rules.*)", new_content, re.S)
+            if match:
+                new_content = match.group(1).strip()
+
+            try:
+                with open(BEHAVIORAL_RULES_FILE_PATH, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                print(f"[INTROSPECTION] Behavioral rules consolidated and updated.")
+            except Exception as e:
+                print(f"[INTROSPECTION] Failed to update behavioral rules: {e}")
 
     def generate_introspection_report(self, session_id: str, flag_high_priority: bool = True) -> str:
         """Combines contradictions and drift into a readable report."""
