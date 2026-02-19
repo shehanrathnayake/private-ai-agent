@@ -42,3 +42,7 @@ INNER_LOOP_GRACE_PERIOD = 1800                # 30 minutes of "Alert" focus afte
 INNER_LOOP_IDLE_REFLECTION_INTERVAL = 1800    # 30 minutes minimum wait once idle
 INNER_LOOP_BACKOFF_FACTOR = 1.5               # Multiplier for idle thinking interval
 INNER_LOOP_MAX_INTERVAL = 86400               # Max delay of 24 hours
+
+# --- Session Management ---
+SESSION_AUTO_IDLE_TIMEOUT = 43200             # 12 hours (in seconds)
+SESSION_TOPIC_SHIFT_THRESHOLD = 0.6            # Lower = more aggressive session splitting

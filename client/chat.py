@@ -15,7 +15,7 @@ def print_banner(host, session_id):
 def chat():
     parser = argparse.ArgumentParser(description="Terminal Chat Client for Private AI Agent")
     parser.add_argument("host", help="Agent host IP or hostname")
-    parser.add_argument("session_id", help="Session ID for the conversation")
+    parser.add_argument("session_id", nargs="?", default="auto", help="Session ID (default: 'auto' for AI-managed)")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode (response times)")
     args = parser.parse_args()
 

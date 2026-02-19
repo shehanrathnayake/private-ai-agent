@@ -17,11 +17,13 @@ _inner_loop_module.inner_loop_instance = _loop  # expose for /debug loop
 _loop.start()
 # ---------------------------------------------------------
 
+from app.session_broker import session_broker
+
 app = FastAPI(title="Private AI Agent API")
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: str = "default_session"
+    session_id: str = "auto"
 
 class ChatResponse(BaseModel):
     response: str
@@ -32,7 +34,9 @@ def read_root():
 
 @app.post("/ask", response_model=ChatResponse)
 def ask(req: ChatRequest):
-    agent_response = run_agent(req.message, req.session_id)
+    # Resolve the session ID automatically if 'auto' or not provided
+    resolved_id = session_broker.resolve_session_id(req.message, req.session_id)
+    agent_response = run_agent(req.message, resolved_id)
     return ChatResponse(response=agent_response)
 
 if __name__ == "__main__":
