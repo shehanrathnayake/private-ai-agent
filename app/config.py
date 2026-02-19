@@ -35,3 +35,10 @@ INNER_THOUGHT_SALIENCE   = float(os.getenv("INNER_THOUGHT_SALIENCE", 0.3))  # th
 INNER_THOUGHT_MAX_COUNT  = int(os.getenv("INNER_THOUGHT_MAX_COUNT", 20))  # cap on stored thoughts
 INNER_THOUGHT_DECAY_MULT = float(os.getenv("INNER_THOUGHT_DECAY_MULT", 2.0))  # decay faster than regular memories
 INNER_THOUGHT_INJECT_THRESHOLD = float(os.getenv("INNER_THOUGHT_INJECT_THRESHOLD", 0.6))  # similarity gate for prompt injection
+
+# Enhanced Behavior Constants
+INNER_LOOP_WANDER_CHANCE = 0.3                # 30% chance for "Wandering Mind" during idle cycles
+INNER_LOOP_GRACE_PERIOD = 1800                # 30 minutes of "Alert" focus after last message
+INNER_LOOP_IDLE_REFLECTION_INTERVAL = 1800    # 30 minutes minimum wait once idle
+INNER_LOOP_BACKOFF_FACTOR = 1.5               # Multiplier for idle thinking interval
+INNER_LOOP_MAX_INTERVAL = 86400               # Max delay of 24 hours

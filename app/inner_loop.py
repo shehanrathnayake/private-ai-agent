@@ -24,6 +24,11 @@ from typing import Optional
 from app.config import (
     INNER_LOOP_ENABLED,
     INNER_LOOP_INTERVAL,
+    INNER_LOOP_WANDER_CHANCE,
+    INNER_LOOP_GRACE_PERIOD,
+    INNER_LOOP_IDLE_REFLECTION_INTERVAL,
+    INNER_LOOP_BACKOFF_FACTOR,
+    INNER_LOOP_MAX_INTERVAL,
 )
 
 
@@ -60,6 +65,7 @@ class InnerLoop(threading.Thread):
         self._circuit_open = False              # True = paused due to failures
         self._circuit_open_until: Optional[datetime] = None
         self._last_skip_reason: str = ""
+        self._idle_cycle_count = 0              # For exponential backoff calculation
 
         # Lazy-initialised inside the thread to avoid import-time side effects
         self._thought_engine = None
@@ -94,6 +100,7 @@ class InnerLoop(threading.Thread):
                 f"Last run at      : {self._last_run_at or 'Never'}",
                 f"Last thought at  : {self._last_thought_at or 'Never'}",
                 f"Circuit breaker  : {'OPEN (paused)' if self._circuit_open else 'Closed (healthy)'}",
+                f"Idle cycles      : {self._idle_cycle_count}",
             ]
             if self._circuit_open and self._circuit_open_until:
                 lines.append(f"Circuit resumes  : {self._circuit_open_until}")
@@ -151,11 +158,55 @@ class InnerLoop(threading.Thread):
         if self._is_circuit_open(now):
             return
 
-        # Guard 2: Generate thought (ThoughtEngine handles "nothing new" internally)
+        # Guard 2: Timing & Activity (Grace Period vs. Absolute Guard + Backoff)
         with self._lock:
             last_thought_ts = self._last_thought_at
 
-        thought = self._thought_engine.think(last_thought_timestamp=last_thought_ts)
+        # Guard 2: Timing & Activity (Grace Period vs. Absolute Guard + Backoff)
+        with self._lock:
+            last_thought_ts = self._last_thought_at
+
+        # Fetch perception to check activity
+        perception = self._thought_engine.perception_builder.build(last_thought_timestamp=last_thought_ts)
+        has_new_activity = perception["has_new_activity"]
+        
+        # Check time since last message for Grace Period
+        time_since_last_msg = perception.get("time_since_last_message") or 0
+        is_in_grace_period = time_since_last_msg < INNER_LOOP_GRACE_PERIOD
+
+        if has_new_activity:
+            # User is active — always focus and reset backoff
+            self._idle_cycle_count = 0
+            mode = "focus"
+        else:
+            # USER IS SILENT
+            if not is_in_grace_period:
+                # Deep Idle Mode: Check Absolute Guard
+                time_since_last_thought = (now - last_thought_ts).total_seconds() if last_thought_ts else 999999
+                threshold = INNER_LOOP_IDLE_REFLECTION_INTERVAL * (INNER_LOOP_BACKOFF_FACTOR ** self._idle_cycle_count)
+                threshold = min(threshold, INNER_LOOP_MAX_INTERVAL)
+                
+                if time_since_last_thought < threshold:
+                    wait_mins = int((threshold - time_since_last_thought) // 60)
+                    self._last_skip_reason = f"Absolute Guard: waiting for idle interval ({wait_mins}m remaining)."
+                    return
+            else:
+                # Grace Period (Alert Phase): Stay alert, no guard
+                self._idle_cycle_count = 0
+
+            # Determine Mode (Significant items vs. Random Wander)
+            is_significant = self._thought_engine.is_significant(perception)
+            import random
+            roll_wander = random.random() < INNER_LOOP_WANDER_CHANCE
+            
+            if not (is_significant or roll_wander):
+                self._last_skip_reason = "Significance Filter: no pending items and wander roll failed."
+                return
+            
+            mode = "focus" if is_significant else "wander"
+
+        # Guard 3: Generate thought
+        thought = self._thought_engine.think(last_thought_timestamp=last_thought_ts, force_mode=mode)
 
         if thought.skipped:
             with self._lock:
@@ -166,6 +217,10 @@ class InnerLoop(threading.Thread):
                 self._consecutive_failures = 0
             self._journal_thought(now, cycle_num, thought, outcome="SKIPPED")
             return
+
+        # If we successfully generated a thought while idle, increment backoff
+        if not has_new_activity and not is_in_grace_period:
+            self._idle_cycle_count += 1
 
         # Thought was generated — check for LLM error (empty thought = failure)
         if not thought.raw_thought:

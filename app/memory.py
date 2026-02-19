@@ -1106,6 +1106,30 @@ class MemoryManager:
             print(f"[INNER] get_recent_inner_thoughts error: {e}")
             return ""
 
+    def get_random_memories(self, count: int = 3) -> List[Dict]:
+        """Returns N random memories from the database for associative 'wandering'."""
+        try:
+            with sqlite3.connect(METADATA_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT type, content, salience, timestamp
+                    FROM vector_metadata
+                    WHERE merged = 0 
+                      AND type NOT IN ('Inner Thought', 'Reflection', 'Identity')
+                    ORDER BY RANDOM()
+                    LIMIT ?
+                """, (count,))
+                rows = cursor.fetchall()
+                return [{
+                    "type": r[0],
+                    "content": r[1],
+                    "salience": r[2],
+                    "timestamp": r[3]
+                } for r in rows]
+        except Exception as e:
+            print(f"[MEMORY] Random memory fetch error: {e}")
+            return []
+
     def prune_inner_thoughts(self):
         """
         Enforces the INNER_THOUGHT_MAX_COUNT cap.

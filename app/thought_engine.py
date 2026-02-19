@@ -78,6 +78,7 @@ class PerceptionBuilder:
             "pending_reminders": 0,
             "pending_tasks": 0,
             "has_new_activity": False,
+            "random_memories": [],  # Spontaneous associations
         }
 
         # 1. Last messages + time since last user message
@@ -165,9 +166,12 @@ class PerceptionBuilder:
             # Tables may not exist yet — that's fine
             pass
 
+        # 6. Random Memories (Phase E supplement)
+        perception["random_memories"] = self.mm.get_random_memories(count=3)
+
         return perception
 
-    def format_for_prompt(self, perception: dict) -> str:
+    def format_for_prompt(self, perception: dict, wander_mode: bool = False) -> str:
         """Formats the perception dict into a clean text block for the LLM."""
         lines = []
 
@@ -179,24 +183,27 @@ class PerceptionBuilder:
         else:
             lines.append("Time since last user message: Unknown (no messages yet)")
 
-        if perception["pending_reminders"] > 0 or perception["pending_tasks"] > 0:
-            lines.append(
-                f"Pending items: {perception['pending_reminders']} reminder(s), "
-                f"{perception['pending_tasks']} task(s)"
-            )
+        if wander_mode:
+            lines.append("\nSPONTANEOUS ASSOCIATIONS (Random past memories):")
+            for rm in perception["random_memories"]:
+                lines.append(f" - [{rm['type']}] {rm['content']}")
+            lines.append("\nNote: You are currently 'wandering'. Ignore current tasks and instead reflect on these past memories. Look for hidden connections or just ponder their significance.")
+        else:
+            if perception["pending_reminders"] > 0 or perception["pending_tasks"] > 0:
+                lines.append(
+                    f"Pending items: {perception['pending_reminders']} reminder(s), "
+                    f"{perception['pending_tasks']} task(s)"
+                )
 
-        if perception["open_threads"]:
-            lines.append(f"\nOpen threads from last session:\n{perception['open_threads']}")
+            if perception["open_threads"]:
+                lines.append(f"\nOpen threads from last session:\n{perception['open_threads']}")
 
-        if perception["last_messages"]:
-            lines.append("\nRecent conversation:")
-            lines.extend(f"  {m}" for m in perception["last_messages"])
+            if perception["last_messages"]:
+                lines.append("\nRecent conversation:")
+                lines.extend(f"  {m}" for m in perception["last_messages"])
 
         if perception["identity_snippet"]:
             lines.append(f"\nUser self-model (excerpt):\n{perception['identity_snippet']}")
-
-        if perception["knowledge_snippet"]:
-            lines.append(f"\nCore knowledge (excerpt):\n{perception['knowledge_snippet']}")
 
         return "\n".join(lines)
 
@@ -208,11 +215,11 @@ class PerceptionBuilder:
 class ThoughtEngine:
     """
     Generates one private inner thought per cycle.
-    Uses a completely separate prompt from the user-facing system prompt.
+    Supports 'Focus' (task-oriented) and 'Wander' (spontaneous association) modes.
     """
 
     # The private thought prompt — introspective, not conversational
-    THOUGHT_PROMPT_TEMPLATE = """\
+    FOCUS_PROMPT_TEMPLATE = """\
 You are the internal reasoning module of an AI assistant named Astra.
 You are thinking PRIVATELY. The user cannot see this. No response is needed.
 
@@ -220,59 +227,77 @@ Your job is to silently reflect on the current situation and decide:
 1. What is worth remembering or flagging?
 2. Is there anything the user might need next time they talk to you?
 3. Are there any open tasks or threads that seem stalled or important?
-4. What patterns do you notice about the user's work or interests?
 
 Keep your thought focused, specific, and grounded in the actual context below.
-Do NOT repeat obvious facts. Do NOT be generic. Think like a thoughtful assistant
-who has been quietly observing and wants to be genuinely useful.
+Do NOT repeat obvious facts. Do NOT be generic. Think like a thoughtful assistant.
 
 --- CURRENT STATE ---
 {perception}
 --- END STATE ---
 
-Respond ONLY in this exact format (no extra text before or after):
-THOUGHT: <your private reasoning, 1-3 sentences, specific and grounded>
-SALIENCE: <a number from 0.1 to 0.9 — how important/useful is this thought?>
-ACT: <yes or no — does this require an external action right now?>
-ACTION_HINT: <if ACT is yes, briefly describe what action; otherwise write "none">
-STORE: <yes or no — is this worth storing in long-term memory?>
+Respond ONLY in this exact format:
+THOUGHT: <your private reasoning, 1-3 sentences>
+SALIENCE: <0.1 to 0.9>
+ACT: <yes or no>
+ACTION_HINT: <describe if ACT is yes, else "none">
+STORE: <yes or no>
+"""
+
+    WANDER_PROMPT_TEMPLATE = """\
+You are the internal reasoning module of an AI assistant named Astra.
+You are 'wandering' — letting your mind associate random past memories.
+
+Your job is to:
+1. Look at the random memories provided.
+2. Form a new connection, curious question, or abstract reflection.
+3. Ignore current pending tasks; be creative and philosophical.
+
+--- SPONTANEOUS MEMORIES ---
+{perception}
+--- END STATE ---
+
+Respond ONLY in this exact format:
+THOUGHT: <your abstract or creative reflection, 1-3 sentences>
+SALIENCE: <0.1 to 0.6 (wandering is usually lower salience)>
+ACT: no
+ACTION_HINT: none
+STORE: yes
 """
 
     def __init__(self, memory_manager):
         self.mm = memory_manager
         self.perception_builder = PerceptionBuilder(memory_manager)
 
-    def think(self, last_thought_timestamp: Optional[datetime] = None) -> Thought:
+    def think(self, last_thought_timestamp: Optional[datetime] = None, force_mode: Optional[str] = None) -> Thought:
         """
         Main entry point. Builds perception, calls LLM, parses output.
-        Returns a Thought — never raises an exception.
+        force_mode: Optional['focus', 'wander']
         """
         # Step 1: Build perception snapshot
         perception = self.perception_builder.build(last_thought_timestamp)
 
-        # Step 2: "Nothing new" guard
-        # If no user activity since last thought AND last thought was recent, skip
-        if not perception["has_new_activity"]:
-            delta = perception.get("time_since_last_message")
-            # If last message was more than 24 hours ago and nothing new, skip
-            if delta is not None and delta > 86400:
-                return Thought(
-                    raw_thought="",
-                    salience=0.0,
-                    should_act=False,
-                    action_hint="none",
-                    memory_worthy=False,
-                    skipped=True,
-                    skip_reason="No user activity in >24h and no new messages since last thought."
-                )
+        # Step 2: Determine Mode
+        wander_mode = force_mode == "wander"
+        if not force_mode:
+            # Default logic: Focus if new activity or significant items exist.
+            # Otherwise, it's an idle cycle.
+            is_significant = self.is_significant(perception)
+            if perception["has_new_activity"] or is_significant:
+                wander_mode = False
+            else:
+                # If everything is idle, roll for a wander
+                import random
+                from app.config import INNER_LOOP_WANDER_CHANCE
+                wander_mode = random.random() < INNER_LOOP_WANDER_CHANCE
 
         # Step 3: Format perception for prompt
-        perception_text = self.perception_builder.format_for_prompt(perception)
+        perception_text = self.perception_builder.format_for_prompt(perception, wander_mode=wander_mode)
 
-        # Step 4: Call LLM with private thought prompt
+        # Step 4: Call LLM
         try:
             from app.openrouter import run_openrouter
-            prompt = self.THOUGHT_PROMPT_TEMPLATE.format(perception=perception_text)
+            template = self.WANDER_PROMPT_TEMPLATE if wander_mode else self.FOCUS_PROMPT_TEMPLATE
+            prompt = template.format(perception=perception_text)
             raw_response = run_openrouter(prompt)
         except Exception as e:
             print(f"[THOUGHT] LLM call failed: {e}")
@@ -288,6 +313,13 @@ STORE: <yes or no — is this worth storing in long-term memory?>
 
         # Step 5: Parse the structured response
         return self._parse_response(raw_response)
+
+    def is_significant(self, perception: dict) -> bool:
+        """Significance Filter: True if there are things requiring attention."""
+        has_pending = (perception.get("pending_reminders", 0) > 0 or 
+                       perception.get("pending_tasks", 0) > 0)
+        has_open_threads = len(perception.get("open_threads", "")) > 5
+        return has_pending or has_open_threads
 
     def _parse_response(self, raw: str) -> Thought:
         """
