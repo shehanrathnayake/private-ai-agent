@@ -136,10 +136,23 @@ def run_agent(user_input: str, session_id: str) -> str:
         "deterministic": {},
         "associative": [],
         "predicted": [],
+        "stitched_context": False,
         "identity": {"triggered": False, "score": 0.0},
         "tool_calls": []
     }
     
+    # Phase 2: Session Stitching & Temporal Context
+    # If this is a new session (< 3 messages) OR user asks "temporal" words, fetch previous summary
+    temporal_keywords = ["earlier", "before", "yesterday", "last time", "previous", "remember"]
+    is_temporal_query = any(k in user_input.lower() for k in temporal_keywords)
+    msg_count = memory_manager.get_message_count(session_id)
+    
+    previous_summary = ""
+    if msg_count < 5 or is_temporal_query:
+        previous_summary = memory_manager.get_previous_summary(session_id)
+        if previous_summary:
+            trace["stitched_context"] = True
+
     # Phase 2: Deterministic Recall
     # Phase 2: Deterministic Recall
     relevant_res = memory_manager.get_relevant_memory(session_id, user_input)
@@ -209,6 +222,9 @@ def run_agent(user_input: str, session_id: str) -> str:
     
     if cross_session_summary:
         prompt_sections.append(cross_session_summary)
+
+    if previous_summary:
+        prompt_sections.append(f"RECENT CONTEXT (PAST SESSION):\nNote: This is what you were doing right before this session started. Use this to orient yourself if the user asks broad temporal questions.\n\n{previous_summary}")
 
     # Phase A4: Inner Thought Injection (similarity-gated)
     inner_thoughts = memory_manager.get_recent_inner_thoughts(top_k=2, user_input=user_input)

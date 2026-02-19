@@ -290,6 +290,32 @@ class MemoryManager:
                 return f.read()
         return ""
 
+    def get_previous_session_id(self, current_session_id: str) -> Optional[str]:
+        """Returns the ID of the session that occurred immediately before the current one."""
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT DISTINCT session_id 
+                    FROM messages 
+                    WHERE session_id != ? 
+                      AND session_id != '__inner__'
+                    ORDER BY timestamp DESC 
+                    LIMIT 1
+                """, (current_session_id,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            print(f"[MEMORY] Error fetching previous session ID: {e}")
+            return None
+
+    def get_previous_summary(self, current_session_id: str) -> str:
+        """Finds the most recent session before current and returns its summary."""
+        prev_id = self.get_previous_session_id(current_session_id)
+        if prev_id:
+            return self.get_summary(prev_id)
+        return ""
+
     def get_messages_since_last_summary(self, session_id: str, limit: int) -> List[Dict[str, str]]:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
