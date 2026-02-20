@@ -152,6 +152,9 @@ def run_agent(user_input: str, session_id: str) -> str:
         previous_summary = memory_manager.get_previous_summary(session_id)
         if previous_summary:
             trace["stitched_context"] = True
+            print(f"[CONTEXT] Session Stitching active: pulled previous summary into prompt.")
+        else:
+            print(f"[CONTEXT] Session Stitching attempted but no previous summary found.")
 
     # Phase 2: Deterministic Recall
     # Phase 2: Deterministic Recall
@@ -224,7 +227,13 @@ def run_agent(user_input: str, session_id: str) -> str:
         prompt_sections.append(cross_session_summary)
 
     if previous_summary:
-        prompt_sections.append(f"RECENT CONTEXT (PAST SESSION):\nNote: This is what you were doing right before this session started. Use this to orient yourself if the user asks broad temporal questions.\n\n{previous_summary}")
+        prompt_sections.append(
+            f"--- CRITICAL RECENT CONTEXT ---\n"
+            f"The current session is new, but this is the summary of your VERY LAST conversation with the user. "
+            f"If the user asks 'what did we do earlier' or 'remember', use the information below as your primary source of truth.\n\n"
+            f"{previous_summary}\n"
+            f"--- END RECENT CONTEXT ---"
+        )
 
     # Phase A4: Inner Thought Injection (similarity-gated)
     inner_thoughts = memory_manager.get_recent_inner_thoughts(top_k=2, user_input=user_input)
