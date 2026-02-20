@@ -1094,7 +1094,13 @@ class MemoryManager:
 
             # If a user input is provided, apply similarity gate
             if user_input.strip():
+                # Meta-Cognitive Override: If asking about identity/thoughts, lower the barrier
+                identity_keywords = ["who are you", "your persona", "inner thoughts", "how do you feel", "personality", "yourself"]
+                force_inject = any(k in user_input.lower() for k in identity_keywords)
+                
                 from app.config import INNER_THOUGHT_INJECT_THRESHOLD
+                gate = 0.1 if force_inject else INNER_THOUGHT_INJECT_THRESHOLD
+                
                 embedding_ui = self._get_embedding(user_input)
                 vec_ui = np.array([embedding_ui]).astype('float32')
                 faiss.normalize_L2(vec_ui)
@@ -1105,7 +1111,7 @@ class MemoryManager:
                     vec_t = np.array([embedding_t]).astype('float32')
                     faiss.normalize_L2(vec_t)
                     sim = float(np.dot(vec_ui, vec_t.T)[0][0])
-                    if sim >= INNER_THOUGHT_INJECT_THRESHOLD:
+                    if sim >= gate:
                         filtered.append((content, salience, sim))
 
                 if not filtered:

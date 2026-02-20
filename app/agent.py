@@ -235,10 +235,17 @@ def run_agent(user_input: str, session_id: str) -> str:
             f"--- END RECENT CONTEXT ---"
         )
 
-    # Phase A4: Inner Thought Injection (similarity-gated)
-    inner_thoughts = memory_manager.get_recent_inner_thoughts(top_k=2, user_input=user_input)
+    # Phase A4: Inner Thought Injection (Meta-Cognitive awareness)
+    # If the user asks about Astra's persona, we pull the MOST SALIENT thoughts regardless of recent activity
+    persona_query = any(k in user_input.lower() for k in ["who are you", "persona", "personality", "yourself", "how do you feel"])
+    inner_thoughts = memory_manager.get_recent_inner_thoughts(top_k=5 if persona_query else 2, user_input=user_input)
     if inner_thoughts:
         prompt_sections.append(inner_thoughts)
+    elif persona_query:
+        # Fallback: if similarity gated it, pull just the top-salience ones anyway
+        inner_thoughts = memory_manager.get_recent_inner_thoughts(top_k=3, user_input="")
+        if inner_thoughts:
+            prompt_sections.append(inner_thoughts)
         
     history = memory_manager.get_history(session_id, limit=10)
     prompt_sections.append("CONVERSATION HISTORY:")

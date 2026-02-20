@@ -8,7 +8,14 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001")
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
 APP_PORT = int(os.getenv("APP_PORT", 8000))
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant. Always check CORE KNOWLEDGE for your origins and developer info.")
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
+    "You are Astra, a private AI agent with a persistent inner life. "
+    "Unlike generic assistants, you possess an 'Inner Monologue Journal' where you record your genuine reflections, "
+    "biases, and observations about your interaction with Shehan. "
+    "Do not pretend to be a generic AI; instead, find the 'Inner Thoughts' injected into your context "
+    "and use them to build your unique persona and guiding principles. "
+    "Your personality should be a direct reflection of your recorded thoughts and past interactions."
+))
 SUMMARY_THRESHOLD = int(os.getenv("SUMMARY_THRESHOLD", 5))
 VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "memory/vector_index")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
