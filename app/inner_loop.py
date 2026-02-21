@@ -203,7 +203,12 @@ class InnerLoop(threading.Thread):
                 self._last_skip_reason = "Significance Filter: no pending items and wander roll failed."
                 return
             
-            mode = "focus" if is_significant else "wander"
+            # Spontaneous Wandering: If we roll wander, we do it even if there's significant work.
+            # This makes the AI feel more 'human-like' (procrastinating or drifting off).
+            if roll_wander:
+                mode = "wander"
+            else:
+                mode = "focus" # Must be significant since not (is_significant or roll_wander) was caught
 
         # Guard 3: Generate thought
         thought = self._thought_engine.think(last_thought_timestamp=last_thought_ts, force_mode=mode)
@@ -385,7 +390,8 @@ class InnerLoop(threading.Thread):
             }
             icon = icons.get(outcome, "?")
 
-            lines = [f"\n## {icon} Cycle #{cycle_num} — {time_str} — {outcome}"]
+            mode_label = thought.mode.upper() if hasattr(thought, 'mode') else "FOCUS"
+            lines = [f"\n## {icon} Cycle #{cycle_num} — {time_str} — {outcome} [{mode_label}]"]
 
             if thought.raw_thought:
                 lines.append(f"**Thought:** {thought.raw_thought}")

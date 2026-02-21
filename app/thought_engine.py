@@ -36,6 +36,7 @@ class Thought:
     should_act: bool            # Does this thought require an external action?
     action_hint: str            # What kind of action, if any
     memory_worthy: bool         # Should this be stored in long-term memory?
+    mode: str = "focus"         # 'focus' or 'wander'
     skipped: bool = False       # True if the cycle was skipped (nothing new)
     skip_reason: str = ""       # Why it was skipped, for logging
 
@@ -312,7 +313,9 @@ STORE: yes
             )
 
         # Step 5: Parse the structured response
-        return self._parse_response(raw_response)
+        thought = self._parse_response(raw_response)
+        thought.mode = "wander" if wander_mode else "focus"
+        return thought
 
     def is_significant(self, perception: dict) -> bool:
         """Significance Filter: True if there are things requiring attention."""
