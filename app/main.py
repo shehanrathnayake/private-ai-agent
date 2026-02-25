@@ -7,6 +7,14 @@ from app.bootstrap import ensure_runtime_environment
 # Ensure filesystem is ready before anything else
 ensure_runtime_environment()
 
+# --- Initialize Modular Skills ---
+from app.skills import skill_registry
+import os
+skill_registry.discover_local_skills()
+config_path = os.path.join(os.path.dirname(__file__), "skills", "config.json")
+skill_registry.discover_mcp_skills(config_path)
+# ---------------------------------
+
 # --- Inner Monologue: start background thinking thread ---
 from app.memory import memory_manager
 from app.inner_loop import InnerLoop
@@ -33,10 +41,10 @@ def read_root():
     return {"status": "online", "message": "Private AI Agent is running"}
 
 @app.post("/ask", response_model=ChatResponse)
-def ask(req: ChatRequest):
+async def ask(req: ChatRequest):
     # Resolve the session ID automatically if 'auto' or not provided
     resolved_id = session_broker.resolve_session_id(req.message, req.session_id)
-    agent_response = run_agent(req.message, resolved_id)
+    agent_response = await run_agent(req.message, resolved_id)
     return ChatResponse(response=agent_response)
 
 if __name__ == "__main__":

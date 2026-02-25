@@ -11,7 +11,7 @@ KNOWLEDGE_FILE = os.path.join(MEMORY_DIR, "knowledge.md")
 IDENTITY_FILE = os.path.join(MEMORY_DIR, "identity.md")
 BEHAVIORAL_RULES_FILE = os.path.join(MEMORY_DIR, "behavioral_rules.md")
 AGENT_DB = os.path.join(MEMORY_DIR, "agent_memory.db")
-TOOL_AUDIT_LOG = os.path.join(MEMORY_DIR, "tool_audit.log")
+SKILL_AUDIT_LOG = os.path.join(MEMORY_DIR, "skill_audit.log")
 
 def ensure_runtime_environment() -> None:
     """

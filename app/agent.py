@@ -9,7 +9,7 @@ from app.config import (
 )
 from app.memory import memory_manager
 
-from app.tools import tool_manager
+from app.skills import skill_registry
 
 from app.bootstrap import (
     IDENTITY_FILE
@@ -18,7 +18,7 @@ from app.bootstrap import (
 # global trace for debugging
 LAST_TRACE = {}
 
-def run_agent(user_input: str, session_id: str) -> str:
+async def run_agent(user_input: str, session_id: str) -> str:
     global LAST_TRACE
     
     # 1. Intercept Debug Commands
@@ -138,7 +138,7 @@ def run_agent(user_input: str, session_id: str) -> str:
         "predicted": [],
         "stitched_context": False,
         "identity": {"triggered": False, "score": 0.0},
-        "tool_calls": []
+        "skill_calls": []
     }
     
     # Phase 2: Session Stitching & Temporal Context
@@ -198,18 +198,18 @@ def run_agent(user_input: str, session_id: str) -> str:
 
     knowledge = memory_manager.get_knowledge()
     
-    # 4. Phase 4: Tool Schema Injection
-    tool_schemas = tool_manager.get_tool_schemas()
+    # 4. Phase 4: Skill Schema Injection
+    skill_schemas = skill_registry.get_skill_schemas()
     
     # 5. Build the prompt
     prompt_sections = [
         SYSTEM_PROMPT,
-        f"\nAVAILABLE TOOLS:\n{tool_schemas}\n"
-        "TO CALL A TOOL, YOU MUST USE THE DELIMITER ---ACTION--- AT THE VERY END OF YOUR RESPONSE.\n"
+        f"\nAVAILABLE SKILLS:\n{skill_schemas}\n"
+        "TO CALL A SKILL, YOU MUST USE THE DELIMITER ---ACTION--- AT THE VERY END OF YOUR RESPONSE.\n"
         "ANYTHING AFTER THIS DELIMITER MUST BE VALID JSON.\n"
         "FORMAT:\n"
         "---ACTION---\n"
-        "{\"tool\": \"tool_name\", \"params\": {\"arg\": \"val\"}, \"reasoning\": \"why\"}\n"
+        "{\"skill\": \"skill_name\", \"params\": {\"arg\": \"val\"}, \"reasoning\": \"why\"}\n"
     ]
     
     if knowledge: prompt_sections.append(f"CORE KNOWLEDGE:\n{knowledge}")
@@ -259,7 +259,7 @@ def run_agent(user_input: str, session_id: str) -> str:
     # 6. Get Response
     agent_response = run_openrouter(full_prompt)
     
-    # 7. Phase 4: Parse & Execute Tool Calls
+    # 7. Phase 4: Parse & Execute Skill Calls
     final_output = agent_response
     if "---ACTION---" in agent_response:
         try:
@@ -274,22 +274,22 @@ def run_agent(user_input: str, session_id: str) -> str:
                     action_json_str = action_json_str.split("```json")[1].split("```")[0].strip()
                 elif "```" in action_json_str:
                     action_json_str = action_json_str.split("```")[1].split("```")[0].strip()
-
                 try:
                     action_data = json.loads(action_json_str)
-                    tool_name = action_data.get("tool")
-                    tool_params = action_data.get("params", {})
+                    # Support both 'skill' (new) and 'tool' (fallback) keys
+                    skill_name = action_data.get("skill") or action_data.get("tool")
+                    skill_params = action_data.get("params", {})
                     reasoning = action_data.get("reasoning", "No reasoning provided.")
                     
-                    # 1. Unknown Tool Check (Fail Fast)
-                    if tool_name not in tool_manager.tools:
-                        final_output = f"{prefix_text}\n\n[SYSTEM] Unknown tool '{tool_name}'. Action aborted."
+                    # 1. Unknown Skill Check (Fail Fast)
+                    if skill_name not in skill_registry.skills:
+                        final_output = f"{prefix_text}\n\n[SYSTEM] Unknown skill '{skill_name}'. Action aborted."
                     else:
-                        trace["tool_calls"].append({"tool": tool_name, "params": tool_params, "reasoning": reasoning})
+                        trace["skill_calls"].append({"skill": skill_name, "params": skill_params, "reasoning": reasoning})
                         
                         # 2. Safety & Approval Check
-                        tool_info = tool_manager.tools[tool_name]
-                        requires_approval = tool_info.get("requires_approval", False)
+                        skill_info = skill_registry.skills[skill_name].get_schema()
+                        requires_approval = skill_info.get("requires_approval", False)
                         
                         # Exact match approval
                         is_approved = user_input.strip() in ["/approve", "/proceed"]
@@ -297,26 +297,26 @@ def run_agent(user_input: str, session_id: str) -> str:
                         if requires_approval and not is_approved:
                             final_output = (
                                 f"{prefix_text}\n\n"
-                                f"⚠️ [SAFETY] I want to call '{tool_name}' for the following reason: {reasoning}.\n"
-                                f"Parameters: {tool_params}\n"
+                                f"⚠️ [SAFETY] I want to call '{skill_name}' for the following reason: {reasoning}.\n"
+                                f"Parameters: {skill_params}\n"
                                 f"Shall I proceed? Please type '/approve' or '/proceed' to confirm."
                             )
                         else:
                             # 3. Execution
-                            tool_result = tool_manager.invoke(tool_name, tool_params, session_id)
-                            result_str = json.dumps(tool_result)
-                            final_output = f"{prefix_text}\n\n[SYSTEM] Tool '{tool_name}' executed. Result: {result_str}"
+                            skill_result = await skill_registry.invoke(skill_name, skill_params, session_id)
+                            result_str = json.dumps(skill_result)
+                            final_output = f"{prefix_text}\n\n[SYSTEM] Skill '{skill_name}' executed. Result: {result_str}"
                             
                             # 4. Success Persistence (Add to Associative Memory)
-                            if tool_result.get("status") == "success":
-                                action_summary = f"Tool executed: {tool_name} -> {result_str[:100]}"
+                            if skill_result.get("status") == "success":
+                                action_summary = f"Skill executed: {skill_name} -> {result_str[:100]}"
                                 memory_manager.add_vector(action_summary, session_id, "Open Threads", salience=0.8)
                                 
                 except json.JSONDecodeError as je:
                     # abort action safely
                     final_output = agent_response + f"\n\n[SYSTEM] Action aborted: Malformed JSON after delimiter."
         except Exception as e:
-            print(f"[PHASE4] General Tool Error: {e}")
+            print(f"[PHASE4] General Skill Error: {e}")
             final_output = agent_response + f"\n\n[SYSTEM] Internal error during action processing."
 
     LAST_TRACE = trace
